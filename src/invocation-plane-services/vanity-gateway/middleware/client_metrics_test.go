@@ -298,3 +298,162 @@ func TestClientMetricDefaultTransport(t *testing.T) {
 		"gateway_call_kind": attribute.StringValue("inference"), "error_source": attribute.StringValue("worker"),
 	}))
 }
+
+const completeMetricName = "nvcf_vanity_gateway_upstream_response_complete"
+
+func histogramPoints(t *testing.T, reader *sdkmetric.ManualReader, name string) []metricdata.HistogramDataPoint[float64] {
+	t.Helper()
+	var points []metricdata.HistogramDataPoint[float64]
+	for _, m := range collectMetrics(t, reader) {
+		if m.Name == name {
+			points = append(points, m.Data.(metricdata.Histogram[float64]).DataPoints...)
+		}
+	}
+	return points
+}
+
+func useTestMeterProvider(t *testing.T) *sdkmetric.ManualReader {
+	t.Helper()
+	reader := sdkmetric.NewManualReader()
+	provider := newHTTPMeterProvider(reader)
+	previous := otel.GetMeterProvider()
+	otel.SetMeterProvider(provider)
+	t.Cleanup(func() { otel.SetMeterProvider(previous); require.NoError(t, provider.Shutdown(context.Background())) })
+	return reader
+}
+
+// gatedBody blocks every Read until the gate is closed, then serves the payload.
+type gatedBody struct {
+	gate   <-chan struct{}
+	reader io.Reader
+}
+
+func (b *gatedBody) Read(p []byte) (int, error) { <-b.gate; return b.reader.Read(p) }
+func (b *gatedBody) Close() error               { return nil }
+
+func completeTestRequest(t *testing.T) *http.Request {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, "http://upstream.test:8080/infer", nil)
+	require.NoError(t, err)
+	return req
+}
+
+func TestResponseCompleteRecordedAtEndOfBody(t *testing.T) {
+	reader := useTestMeterProvider(t)
+	gate := make(chan struct{})
+	transport := TracedRoundTripper(clientMetricTestTransport(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: &gatedBody{gate: gate, reader: strings.NewReader("stream")}}, nil
+	}))
+
+	resp, err := transport.RoundTrip(completeTestRequest(t))
+	require.NoError(t, err)
+
+	// Headers are back: the existing metric has a point, the new one does not.
+	require.Len(t, histogramPoints(t, reader, "http.client.request.duration"), 1)
+	require.Empty(t, histogramPoints(t, reader, completeMetricName))
+
+	const bodyDelay = 60 * time.Millisecond
+	time.AfterFunc(bodyDelay, func() { close(gate) })
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, "stream", string(body))
+	require.NoError(t, resp.Body.Close())
+
+	points := histogramPoints(t, reader, completeMetricName)
+	require.Len(t, points, 1)
+	require.EqualValues(t, 1, points[0].Count)
+	require.GreaterOrEqual(t, points[0].Sum, bodyDelay.Seconds())
+	require.Equal(t, httpDurationHistogramBoundaries, points[0].Bounds)
+}
+
+func TestResponseCompleteRecordsOnceOnReadThenClose(t *testing.T) {
+	reader := useTestMeterProvider(t)
+	transport := TracedRoundTripper(clientMetricTestTransport(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("ok"))}, nil
+	}))
+	resp, err := transport.RoundTrip(completeTestRequest(t))
+	require.NoError(t, err)
+	_, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.NoError(t, resp.Body.Close())
+
+	points := histogramPoints(t, reader, completeMetricName)
+	require.Len(t, points, 1)
+	require.EqualValues(t, 1, points[0].Count)
+}
+
+func TestResponseCompleteRecordsOnCloseWithoutReading(t *testing.T) {
+	reader := useTestMeterProvider(t)
+	transport := TracedRoundTripper(clientMetricTestTransport(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("unread"))}, nil
+	}))
+	resp, err := transport.RoundTrip(completeTestRequest(t))
+	require.NoError(t, err)
+	require.Empty(t, histogramPoints(t, reader, completeMetricName))
+	require.NoError(t, resp.Body.Close())
+
+	points := histogramPoints(t, reader, completeMetricName)
+	require.Len(t, points, 1)
+	require.EqualValues(t, 1, points[0].Count)
+}
+
+func TestResponseCompleteSkippedOnTransportError(t *testing.T) {
+	reader := useTestMeterProvider(t)
+	transport := TracedRoundTripper(clientMetricTestTransport(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("connection failed")
+	}))
+	_, err := transport.RoundTrip(completeTestRequest(t))
+	require.Error(t, err)
+	require.Empty(t, histogramPoints(t, reader, completeMetricName))
+}
+
+func TestResponseCompleteLabelsMatchClientDuration(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		status     int
+		source     string
+		wantSource string
+		shadow     bool
+	}{
+		{name: "success", status: 200},
+		{name: "worker error", status: 500, source: "worker", wantSource: "worker"},
+		{name: "unknown source", status: 503, wantSource: "unknown"},
+		{name: "shadow", status: 200, shadow: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := useTestMeterProvider(t)
+			transport := TracedRoundTripper(clientMetricTestTransport(func(*http.Request) (*http.Response, error) {
+				h := http.Header{}
+				h.Set(ErrorSourceHeader, tc.source)
+				return &http.Response{StatusCode: tc.status, Header: h, Body: io.NopCloser(strings.NewReader("body"))}, nil
+			}))
+			req := completeTestRequest(t)
+			if tc.shadow {
+				req = req.WithContext(ShadowTelemetryContext(req.Context()))
+			}
+			resp, err := transport.RoundTrip(req)
+			require.NoError(t, err)
+			_, err = io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+
+			client := histogramPoints(t, reader, "http.client.request.duration")
+			complete := histogramPoints(t, reader, completeMetricName)
+			require.Len(t, client, 1)
+			require.Len(t, complete, 1)
+			require.Equal(t, client[0].Attributes.ToSlice(), complete[0].Attributes.ToSlice())
+
+			got, present := complete[0].Attributes.Value("error_source")
+			if tc.wantSource == "" {
+				require.False(t, present)
+			} else {
+				require.True(t, present)
+				require.Equal(t, tc.wantSource, got.AsString())
+			}
+			kind, present := complete[0].Attributes.Value("gateway_call_kind")
+			require.True(t, present)
+			require.Equal(t, CallKindInference, kind.AsString())
+		})
+	}
+}

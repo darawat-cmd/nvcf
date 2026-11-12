@@ -31,8 +31,8 @@ var (
 )
 
 var httpDurationHistogramBoundaries = []float64{
-	0.1, 0.25, 0.5, 0.75, 1, 2, 5, 10,
-	15, 30, 60, 120, 300, 600, 900,
+	0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 2.5,
+	3, 5, 10, 15, 30, 60, 120, 300, 600, 900,
 }
 
 func SetupHTTPMetrics() error {

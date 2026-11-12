@@ -20,11 +20,18 @@ package middleware
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // Bounded values of the gateway_call_kind client metric label.
@@ -34,6 +41,11 @@ const (
 	CallKindHealth      = "health"
 	CallKindModelAccess = "model_access"
 )
+
+// responseCompleteMetricName is the instrument name. The Prometheus exporter
+// appends the unit, so it is exported as
+// nvcf_vanity_gateway_upstream_response_complete_seconds.
+const responseCompleteMetricName = "nvcf_vanity_gateway_upstream_response_complete"
 
 type callKindContextKey struct{}
 
@@ -61,9 +73,31 @@ func clientMetricContext(ctx context.Context) context.Context {
 	return otelhttp.ContextWithLabeler(ctx, labeler)
 }
 
-type clientMetricsRoundTripper struct{ http.RoundTripper }
+// newResponseCompleteHistogram creates the histogram that measures the time
+// from sending the upstream request to the end of the response body. It
+// returns nil if the instrument cannot be created, which disables recording.
+func newResponseCompleteHistogram(mp metric.MeterProvider) metric.Float64Histogram {
+	histogram, err := mp.Meter("vanity-gateway/middleware").Float64Histogram(
+		responseCompleteMetricName,
+		metric.WithUnit("s"),
+		metric.WithDescription("Time from sending the upstream request to the end of the response body."),
+		metric.WithExplicitBucketBoundaries(httpDurationHistogramBoundaries...),
+	)
+	if err != nil {
+		otel.Handle(err)
+		return nil
+	}
+	return histogram
+}
+
+type clientMetricsRoundTripper struct {
+	http.RoundTripper
+	// complete records the duration to end of body. It may be nil.
+	complete metric.Float64Histogram
+}
 
 func (rt clientMetricsRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	start := time.Now()
 	response, err := rt.RoundTripper.RoundTrip(r)
 	labeler, _ := otelhttp.LabelerFromContext(r.Context())
 	if err != nil {
@@ -85,5 +119,67 @@ func (rt clientMetricsRoundTripper) RoundTrip(r *http.Request) (*http.Response, 
 		}
 		labeler.Add(attribute.String("error_source", source))
 	}
+
+	// otelhttp records http.client.request.duration when headers arrive, so
+	// streamed bodies are invisible to it. Record the end-of-body duration
+	// separately when the body reaches EOF or is closed.
+	if rt.complete != nil && err == nil && response != nil && response.Body != nil {
+		response.Body = &completeTimingBody{
+			ReadCloser: response.Body,
+			record: func() {
+				rt.complete.Record(r.Context(), time.Since(start).Seconds(),
+					metric.WithAttributes(completeAttributes(r, response, labeler)...))
+			},
+		}
+	}
 	return response, err
+}
+
+// completeTimingBody calls record once, on the first read error (including
+// io.EOF) or on Close, whichever comes first.
+type completeTimingBody struct {
+	io.ReadCloser
+	once   sync.Once
+	record func()
+}
+
+func (b *completeTimingBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.once.Do(b.record)
+	}
+	return n, err
+}
+
+func (b *completeTimingBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(b.record)
+	return err
+}
+
+// completeAttributes mirrors the labels otelhttp puts on
+// http.client.request.duration so both series can be compared per label set.
+func completeAttributes(r *http.Request, response *http.Response, labeler *otelhttp.Labeler) []attribute.KeyValue {
+	attrs := []attribute.KeyValue{
+		attribute.String("http.request.method", r.Method),
+		attribute.String("url.scheme", r.URL.Scheme),
+		attribute.String("server.address", r.URL.Hostname()),
+		attribute.Int("http.response.status_code", response.StatusCode),
+	}
+	if port := r.URL.Port(); port != "" {
+		if n, err := strconv.Atoi(port); err == nil {
+			attrs = append(attrs, attribute.Int("server.port", n))
+		}
+	}
+	if version, ok := strings.CutPrefix(r.Proto, "HTTP/"); ok && version != "" {
+		attrs = append(attrs,
+			attribute.String("network.protocol.name", "http"),
+			attribute.String("network.protocol.version", version),
+		)
+	}
+	attrs = append(attrs, shadowMetricAttributes(r)...)
+	if labeler != nil {
+		attrs = append(attrs, labeler.Get()...)
+	}
+	return attrs
 }
