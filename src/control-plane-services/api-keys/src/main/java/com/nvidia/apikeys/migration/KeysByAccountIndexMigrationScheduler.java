@@ -18,6 +18,8 @@
 package com.nvidia.apikeys.migration;
 
 import com.nvidia.apikeys.config.NakProperties;
+import java.time.Duration;
+import java.util.function.LongSupplier;
 import lombok.RequiredArgsConstructor;
 import net.javacrumbs.shedlock.core.LockAssert;
 import net.javacrumbs.shedlock.core.LockExtender;
@@ -42,6 +44,33 @@ public class KeysByAccountIndexMigrationScheduler {
     public void run() {
         LockAssert.assertLocked();
         var config = properties.getMigration().getKeysByAccountIndex();
-        task.run(() -> LockExtender.extendActiveLock(config.getLockAtMostFor(), config.getLockAtLeastFor()));
+        var atMost = config.getLockAtMostFor();
+        var atLeast = config.getLockAtLeastFor();
+        task.run(new LockRenewal(() -> LockExtender.extendActiveLock(atMost, atLeast),
+                atMost.dividedBy(3), System::nanoTime));
+    }
+
+    static final class LockRenewal implements Runnable {
+        private final Runnable extend;
+        private final long intervalNanos;
+        private final LongSupplier nanoTime;
+        private long lastRenewal;
+        private boolean renewed;
+
+        LockRenewal(Runnable extend, Duration interval, LongSupplier nanoTime) {
+            this.extend = extend;
+            this.intervalNanos = interval.toNanos();
+            this.nanoTime = nanoTime;
+        }
+
+        @Override
+        public void run() {
+            var now = nanoTime.getAsLong();
+            if (!renewed || now - lastRenewal >= intervalNanos) {
+                extend.run();
+                lastRenewal = now;
+                renewed = true;
+            }
+        }
     }
 }

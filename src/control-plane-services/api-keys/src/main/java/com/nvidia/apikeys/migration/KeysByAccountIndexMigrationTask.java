@@ -289,8 +289,9 @@ public class KeysByAccountIndexMigrationTask {
         do {
             renewLock.run();
             var state = cursor;
-            var page = fetch(() -> fetch.apply(state));
+            var page = fetch(() -> fetch.apply(state), renewLock);
             for (var row : page.rows()) {
+                renewLock.run();
                 process.accept(row);
             }
             renewLock.run();
@@ -299,9 +300,10 @@ public class KeysByAccountIndexMigrationTask {
         } while (cursor != null);
     }
 
-    private <T> Page<T> fetch(Supplier<Page<T>> fetch) {
+    private <T> Page<T> fetch(Supplier<Page<T>> fetch, Runnable renewLock) {
         RuntimeException failure = null;
         for (var attempt = 0; attempt < config().getPageFetchAttempts(); attempt++) {
+            renewLock.run();
             try {
                 return fetch.get();
             } catch (RuntimeException e) {

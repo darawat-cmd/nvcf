@@ -54,6 +54,8 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -243,6 +245,66 @@ class KeysByAccountIndexMigrationTaskTest {
         verify(markers, never()).markCompleted(anyString(), anyString(), any());
         assertThat(registry.get("nvcf_api_keys_keys_by_account_index_copy_runs_total")
                 .tag("outcome", "failed").counter().count()).isEqualTo(1);
+    }
+
+    @Test
+    void renewalFailureInsidePageStopsBeforeNextRow() {
+        var model = KeyByOwnerAndServiceModel.builder().ownerType(KeyOwnerType.USER).ownerId("owner").build();
+        var row = new TimedRow<>(model, 0);
+        when(dao.accountPage(null, 500)).thenReturn(new Page<>(List.of(), null));
+        when(dao.ownerPage(null, 500)).thenReturn(new Page<>(List.of(row, row, row), null));
+
+        task.run(() -> {
+            if (result("skipped") > 0) {
+                throw new IllegalStateException("lock lost during page");
+            }
+        });
+
+        assertThat(result("skipped")).isEqualTo(1);
+        verify(markers, never()).markCompleted(anyString(), anyString(), any());
+        assertThat(registry.get("nvcf_api_keys_keys_by_account_index_copy_runs_total")
+                .tag("outcome", "failed").counter().count()).isEqualTo(1);
+    }
+
+    @Test
+    void renewalFailureBetweenFetchAttemptsStopsRetries() {
+        var attempts = new AtomicInteger();
+        when(dao.accountPage(null, 500)).thenReturn(new Page<>(List.of(), null));
+        when(dao.ownerPage(null, 500)).thenAnswer(call -> {
+            attempts.incrementAndGet();
+            throw new IllegalStateException("fetch failed");
+        });
+
+        task.run(() -> {
+            if (attempts.get() > 0) {
+                throw new IllegalStateException("lock lost between retries");
+            }
+        });
+
+        verify(dao).ownerPage(null, 500);
+        verify(markers, never()).markCompleted(anyString(), anyString(), any());
+    }
+
+    @Test
+    void renewalUsesElapsedTimeAndThrottlesRepeatedChecks() {
+        var nanos = new AtomicLong(-Duration.ofSeconds(5).toNanos());
+        var extensions = new AtomicInteger();
+        var renewal = new KeysByAccountIndexMigrationScheduler.LockRenewal(
+                extensions::incrementAndGet, Duration.ofSeconds(1), nanos::get);
+        renewal.run();
+        for (var i = 0; i < 500; i++) {
+            nanos.addAndGet(Duration.ofMillis(1).toNanos());
+            renewal.run();
+        }
+        assertThat(extensions.get()).isEqualTo(1);
+
+        nanos.addAndGet(Duration.ofMillis(500).toNanos());
+        renewal.run();
+        assertThat(extensions.get()).isEqualTo(2);
+
+        nanos.addAndGet(Duration.ofSeconds(1).toNanos());
+        renewal.run();
+        assertThat(extensions.get()).isEqualTo(3);
     }
 
     @Test

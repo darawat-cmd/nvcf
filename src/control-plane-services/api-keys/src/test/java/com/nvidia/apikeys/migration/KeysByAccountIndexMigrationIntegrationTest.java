@@ -53,6 +53,8 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import net.javacrumbs.shedlock.core.DefaultLockingTaskExecutor;
 import net.javacrumbs.shedlock.core.LockAssert;
 import net.javacrumbs.shedlock.core.LockConfiguration;
@@ -614,6 +616,42 @@ class KeysByAccountIndexMigrationIntegrationTest {
         assertThat(completed()).isFalse();
         task(dao).run(() -> { });
         assertThat(completed()).isTrue();
+    }
+
+    @Test
+    void renewsCassandraLockWithinSlowPageAndKeepsContenderOut() {
+        properties.getMigration().getKeysByAccountIndex().setPageSize(10);
+        for (var i = 0; i < 3; i++) {
+            seed(source().toBuilder().keyId("slow-key-" + i).keyHash("slow-hash-" + i).build(), false);
+        }
+        var nanos = new AtomicLong();
+        var renewals = new AtomicInteger();
+        var racing = spy(dao);
+        doAnswer(call -> {
+            // Advance elapsed time instead of sleeping through a full lease.
+            nanos.addAndGet(Duration.ofSeconds(20).toNanos());
+            return call.callRealMethod();
+        }).when(racing).credential(anyString());
+        var executor = new DefaultLockingTaskExecutor(lockProvider);
+        executor.executeWithLock((Runnable) () -> {
+            var renewal = new KeysByAccountIndexMigrationScheduler.LockRenewal(() -> {
+                var before = session.execute("SELECT lockuntil FROM lock WHERE name=?", "slow-page-test")
+                        .one().getInstant("lockuntil");
+                LockExtender.extendActiveLock(Duration.ofMinutes(1), Duration.ZERO);
+                var after = session.execute("SELECT lockuntil FROM lock WHERE name=?", "slow-page-test")
+                        .one().getInstant("lockuntil");
+                assertThat(after).isAfter(before);
+                assertThat(lockProvider.lock(new LockConfiguration(Instant.now(), "slow-page-test",
+                        Duration.ofMinutes(1), Duration.ZERO))).isEmpty();
+                renewals.incrementAndGet();
+            }, Duration.ofSeconds(20), nanos::get);
+
+            task(racing).run(renewal);
+        }, new LockConfiguration(Instant.now(), "slow-page-test", Duration.ofSeconds(30), Duration.ZERO));
+
+        assertThat(renewals.get()).isEqualTo(4);
+        assertThat(result("copied")).isEqualTo(3);
+        assertThat(completed()).isFalse();
     }
 
     @Test
