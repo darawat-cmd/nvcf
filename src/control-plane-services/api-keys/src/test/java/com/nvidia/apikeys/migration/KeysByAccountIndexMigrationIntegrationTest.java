@@ -52,7 +52,6 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import net.javacrumbs.shedlock.core.DefaultLockingTaskExecutor;
 import net.javacrumbs.shedlock.core.LockAssert;
 import net.javacrumbs.shedlock.core.LockConfiguration;
@@ -199,6 +198,145 @@ class KeysByAccountIndexMigrationIntegrationTest {
     }
 
     @Test
+    void legacyOnlyAssignmentSurvivesDefaultChangeWithoutCreatingCredential() {
+        var source = source();
+        seed(source, false);
+        task(dao).run(() -> { });
+        var originalAccount = accountModel(source);
+        properties.setNcaId("changed-default");
+
+        task(dao).run(() -> { });
+        task(dao).run(() -> { });
+
+        assertThat(dao.account(originalAccount)).isPresent();
+        assertThat(dao.account(accountModel(source))).isEmpty();
+        assertThat(dao.credential(source.getKeyHash())).isEmpty();
+        assertThat(completed()).isTrue();
+    }
+
+    @Test
+    void interruptedCopyRetainsItsAssignmentBeforeCredentialBackfill() {
+        var source = source();
+        seed(source, true);
+        var interrupted = spy(dao);
+        doAnswer(call -> { throw new IllegalStateException("credential backfill interrupted"); })
+                .when(interrupted).setCredentialNcaId(anyString(), anyString(), anyLong());
+        task(interrupted).run(() -> { });
+        var originalAccount = accountModel(source);
+        properties.setNcaId("changed-default");
+
+        task(dao).run(() -> { });
+        task(dao).run(() -> { });
+
+        assertThat(dao.account(originalAccount)).isPresent();
+        assertThat(dao.account(accountModel(source))).isEmpty();
+        assertThat(dao.credential(source.getKeyHash()).orElseThrow().model().getNcaId()).isEqualTo(savedNcaId);
+        assertThat(completed()).isTrue();
+    }
+
+    @Test
+    void interruptedCopyBeforeAccountWriteRetainsAssignmentAtSourceTimestamp() {
+        var source = source();
+        seed(source, false);
+        var interrupted = spy(dao);
+        doAnswer(call -> { throw new IllegalStateException("account copy interrupted"); })
+                .when(interrupted).copy(any(), anyLong());
+
+        task(interrupted).run(() -> { });
+
+        var retained = dao.ownerPage(null, 10).rows().getFirst();
+        assertThat(retained.model().getNcaId()).isEqualTo(savedNcaId);
+        assertThat(retained.timestamp()).isEqualTo(timestamp);
+        var originalAccount = accountModel(source);
+        assertThat(dao.account(originalAccount)).isEmpty();
+        properties.setNcaId("changed-default");
+
+        task(dao).run(() -> { });
+        task(dao).run(() -> { });
+
+        assertThat(dao.account(originalAccount)).isPresent();
+        assertThat(dao.account(accountModel(source))).isEmpty();
+        assertThat(dao.credential(source.getKeyHash())).isEmpty();
+        assertThat(completed()).isTrue();
+    }
+
+    @Test
+    void deleteBeforeAssignmentWriteDoesNotRecreateLegacyRow() {
+        var source = source();
+        seed(source, false);
+        var racing = spy(dao);
+        doAnswer(call -> {
+            template.delete(ownerConverter.voToModel(source), deleteAt(timestamp + 10));
+            return call.callRealMethod();
+        }).when(racing).setOwnerNcaId(any(), anyString(), anyLong());
+
+        task(racing).run(() -> { });
+
+        assertThat(dao.ownerPage(null, 10).rows()).allSatisfy(row -> {
+            assertThat(row.model().getKeyId()).isNull();
+            assertThat(row.model().getNcaId()).isNull();
+        });
+        assertThat(dao.account(accountModel(source))).isEmpty();
+        assertThat(dao.credential(source.getKeyHash())).isEmpty();
+        assertThat(result("retry")).isEqualTo(1);
+        assertThat(completed()).isFalse();
+    }
+
+    @Test
+    void newerOwnerAssignmentWinsAndBlocksConflictingCopy() {
+        var source = source();
+        seed(source, false);
+        var racing = spy(dao);
+        doAnswer(call -> {
+            dao.setOwnerNcaId(ownerConverter.voToModel(source), "concurrent-account", timestamp + 10);
+            return call.callRealMethod();
+        }).when(racing).setOwnerNcaId(any(), anyString(), anyLong());
+
+        task(racing).run(() -> { });
+
+        var retained = dao.ownerPage(null, 10).rows().getFirst();
+        assertThat(retained.model().getNcaId()).isEqualTo("concurrent-account");
+        assertThat(dao.account(accountModel(source))).isEmpty();
+        assertThat(result("conflict")).isEqualTo(1);
+        assertThat(completed()).isFalse();
+    }
+
+    @Test
+    void existingAccountOnlyAssignmentIsRecoveredBeforeUsingChangedDefault() {
+        var source = source();
+        seed(source, false);
+        var originalAccount = accountModel(source);
+        dao.copy(originalAccount, timestamp);
+        properties.setNcaId("changed-default");
+
+        task(dao).run(() -> { });
+        task(dao).run(() -> { });
+
+        assertThat(dao.account(originalAccount)).isPresent();
+        assertThat(dao.account(accountModel(source))).isEmpty();
+        assertThat(dao.credential(source.getKeyHash())).isEmpty();
+        assertThat(completed()).isTrue();
+    }
+
+    @Test
+    void conflictingAccountRowsBlockCompletionWithoutAssigningTheNewDefault() {
+        var source = source();
+        seed(source, false);
+        dao.copy(accountModel(source), timestamp);
+        var other = target(source).toBuilder().ncaId("other-account")
+                .ncaIdInDetails("other-account").build();
+        dao.copy(accountConverter.voToModel(other), timestamp);
+        properties.setNcaId("changed-default");
+
+        task(dao).run(() -> { });
+
+        assertThat(result("conflict")).isPositive();
+        assertThat(dao.account(accountModel(source))).isEmpty();
+        assertThat(dao.credential(source.getKeyHash())).isEmpty();
+        assertThat(completed()).isFalse();
+    }
+
+    @Test
     void assignmentsSurviveConfigurationChangesAndConflictsBlockCompletion() {
         var source = source().toBuilder().ncaId("assigned").ncaIdInDetails("assigned").build();
         seed(source, true);
@@ -245,12 +383,14 @@ class KeysByAccountIndexMigrationIntegrationTest {
     }
 
     @Test
-    void restartAfterPartialPageAndLaterLegacyWritesConvergeEvenAfterM0() {
+    void restartAfterCredentialWriteAndLaterLegacyWritesConvergeEvenAfterM0() {
         var first = source();
         seed(first, true);
         var interrupted = spy(dao);
-        doAnswer(call -> { throw new IllegalStateException("restart before account scan"); })
-                .when(interrupted).accountPage(any(), anyInt());
+        doAnswer(call -> {
+            call.callRealMethod();
+            throw new IllegalStateException("restart after credential write");
+        }).when(interrupted).setCredentialNcaId(anyString(), anyString(), anyLong());
         task(interrupted).run(() -> { });
         assertThat(completed()).isFalse();
 
@@ -351,15 +491,12 @@ class KeysByAccountIndexMigrationIntegrationTest {
         template.getCqlOperations().execute("TRUNCATE keys_by_owner_and_account_and_service");
         dao.copy(model, timestamp);
         var racing = spy(dao);
-        var checks = new AtomicInteger();
         doAnswer(call -> {
-            if (checks.incrementAndGet() == 2) {
-                seed(source, false);
-            }
-            return call.callRealMethod();
-        }).when(racing).ownerExists(any(), any());
+            var absent = call.callRealMethod();
+            seed(source, false);
+            return absent;
+        }).when(racing).owner(any(), any());
         task(racing).run(() -> { });
-        assertThat(checks.get()).isEqualTo(2);
         assertThat(dao.account(model)).isPresent();
         assertThat(completed()).isFalse();
     }
