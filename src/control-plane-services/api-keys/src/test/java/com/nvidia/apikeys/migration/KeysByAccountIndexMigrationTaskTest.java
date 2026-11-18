@@ -167,7 +167,7 @@ class KeysByAccountIndexMigrationTaskTest {
 
         task.run(() -> { });
 
-        verify(dao, never()).copy(any(), anyLong());
+        verify(dao, never()).copy(any(), any(TimedRow.class));
         verify(dao, never()).setCredentialNcaId(anyString(), anyString(), anyLong());
         verify(markers, never()).markCompleted(anyString(), anyString(), any());
         assertThat(result("conflict")).isEqualTo(1);

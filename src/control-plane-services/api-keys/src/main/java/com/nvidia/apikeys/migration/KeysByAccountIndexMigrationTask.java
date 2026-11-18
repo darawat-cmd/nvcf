@@ -173,7 +173,7 @@ public class KeysByAccountIndexMigrationTask {
             var targetModel = accountConverter.voToModel(target);
             var stored = dao.account(targetModel);
             if (stored.isEmpty() || !sameAccount(stored.get().model(), target)) {
-                dao.copy(targetModel, source.timestamp());
+                dao.copy(targetModel, source);
                 changed = true;
                 var written = dao.account(targetModel);
                 if (written.isEmpty() || !sameAccount(written.get().model(), target)) {

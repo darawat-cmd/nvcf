@@ -34,6 +34,7 @@ import com.nvidia.apikeys.config.KeysByAccountIndexMigrationProperties;
 import com.nvidia.apikeys.config.NakProperties;
 import com.nvidia.apikeys.facade.AdminFacade;
 import com.nvidia.apikeys.persistance.dao.KeysByAccountIndexMigrationDao;
+import com.nvidia.apikeys.persistance.dao.KeysByAccountIndexMigrationDao.TimedRow;
 import com.nvidia.apikeys.persistance.dao.RowUpdateLockDao;
 import com.nvidia.apikeys.persistance.models.KeyByOwnerAndAccountAndServiceModel;
 import com.nvidia.apikeys.persistance.models.KeyByOwnerAndServiceModel;
@@ -160,6 +161,103 @@ class KeysByAccountIndexMigrationIntegrationTest {
     }
 
     @Test
+    void copyPreservesIndividualColumnTimesAndDerivesCreatedAtFromDetails() {
+        var source = source().toBuilder().ncaId(savedNcaId).ncaIdInDetails(savedNcaId)
+                .expiresAt(Instant.parse("2030-01-01T00:00:00Z"))
+                .deletesAt(Instant.parse("2031-01-01T00:00:00Z")).build();
+        seed(source, false);
+        var updatedDetails = ownerConverter.voToModel(source.toBuilder().description("updated details").build());
+        session.execute("UPDATE keys_by_owner_and_service USING TIMESTAMP ? SET key_details=? "
+                        + "WHERE owner_type=? AND owner_id=? AND issuer_service_id=? AND key_id=?",
+                timestamp + 20, updatedDetails.getKeyDetails(), source.getOwnerType().name(), source.getOwnerId(),
+                source.getIssuerServiceId(), source.getKeyId());
+        session.execute("UPDATE keys_by_owner_and_service USING TIMESTAMP ? SET expires_at=?, deletes_at=? "
+                        + "WHERE owner_type=? AND owner_id=? AND issuer_service_id=? AND key_id=?",
+                timestamp + 10, source.getExpiresAt(), source.getDeletesAt(), source.getOwnerType().name(),
+                source.getOwnerId(), source.getIssuerServiceId(), source.getKeyId());
+        dao.setOwnerNcaId(ownerConverter.voToModel(source), savedNcaId, timestamp + 100);
+
+        task(dao).run(() -> { });
+
+        var copied = dao.account(accountModel(source)).orElseThrow();
+        assertThat(copied.writeTimes()).containsEntry("key_status", timestamp)
+                .containsEntry("expires_at", timestamp + 10).containsEntry("deletes_at", timestamp + 10)
+                .containsEntry("key_details", timestamp + 20).containsEntry("created_at", timestamp + 20);
+        assertThat(copied.timestamp()).isEqualTo(timestamp + 20);
+        assertThat(account(source).getDescription()).isEqualTo("updated details");
+        task(dao).run(() -> { });
+        assertThat(completed()).isTrue();
+    }
+
+    @Test
+    void interruptedCopyBetweenColumnTimesConvergesOnRetry() {
+        var source = source();
+        seed(source, false);
+        session.execute("UPDATE keys_by_owner_and_service USING TIMESTAMP ? SET key_status=? "
+                        + "WHERE owner_type=? AND owner_id=? AND issuer_service_id=? AND key_id=?",
+                timestamp + 10, "SUSPENDED", source.getOwnerType().name(), source.getOwnerId(),
+                source.getIssuerServiceId(), source.getKeyId());
+        var interrupted = spy(dao);
+        doAnswer(call -> {
+            call.callRealMethod();
+            throw new IllegalStateException("interrupted between column writes");
+        }).when(interrupted).copy(any(), anyLong());
+
+        task(interrupted).run(() -> { });
+
+        assertThat(dao.account(accountModel(source)).orElseThrow().model().getKeyDetails()).isNotBlank();
+        assertThat(completed()).isFalse();
+        task(dao).run(() -> { });
+        task(dao).run(() -> { });
+
+        var copied = dao.account(accountModel(source)).orElseThrow();
+        assertThat(copied.model().getKeyStatus()).isEqualTo(KeyStatus.SUSPENDED);
+        assertThat(copied.writeTimes()).containsEntry("key_status", timestamp + 10)
+                .containsEntry("key_details", timestamp);
+        assertThat(completed()).isTrue();
+    }
+
+    @Test
+    void newerAssignmentMetadataDoesNotPromoteStaleAccountValues() {
+        var source = source().toBuilder().ncaId(savedNcaId).ncaIdInDetails(savedNcaId).build();
+        seed(source, true);
+        var newer = target(source).toBuilder().keyStatus(KeyStatus.SUSPENDED)
+                .description("newer account details").expiresAt(Instant.parse("2030-01-01T00:00:00Z"))
+                .deletesAt(Instant.parse("2031-01-01T00:00:00Z")).build();
+        dao.copy(accountConverter.voToModel(newer), timestamp + 50);
+        dao.setOwnerNcaId(ownerConverter.voToModel(source), savedNcaId, timestamp + 100);
+
+        task(dao).run(() -> { });
+
+        var stored = account(source);
+        assertThat(stored.getKeyStatus()).isEqualTo(newer.getKeyStatus());
+        assertThat(stored.getDescription()).isEqualTo(newer.getDescription());
+        assertThat(stored.getExpiresAt()).isEqualTo(newer.getExpiresAt());
+        assertThat(stored.getDeletesAt()).isEqualTo(newer.getDeletesAt());
+        assertThat(dao.account(accountModel(source)).orElseThrow().timestamp()).isEqualTo(timestamp + 50);
+        assertThat(completed()).isFalse();
+    }
+
+    @Test
+    void newerAssignmentMetadataDoesNotResurrectDeletedAccountColumn() {
+        var source = source().toBuilder().ncaId(savedNcaId).ncaIdInDetails(savedNcaId)
+                .expiresAt(Instant.parse("2030-01-01T00:00:00Z")).build();
+        seed(source, true);
+        var target = accountModel(source);
+        dao.copy(target, timestamp);
+        session.execute("UPDATE keys_by_owner_and_account_and_service USING TIMESTAMP ? SET expires_at=null "
+                        + "WHERE nca_id=? AND owner_type=? AND owner_id=? AND issuer_service_id=? AND key_id=?",
+                timestamp + 50, target.getNcaId(), target.getOwnerType().name(), target.getOwnerId(),
+                target.getIssuerServiceId(), target.getKeyId());
+        dao.setOwnerNcaId(ownerConverter.voToModel(source), savedNcaId, timestamp + 100);
+
+        task(dao).run(() -> { });
+
+        assertThat(dao.account(target).orElseThrow().model().getExpiresAt()).isNull();
+        assertThat(completed()).isFalse();
+    }
+
+    @Test
     void pagesAcrossKeysAndSkipsPartitionsThatOnlyHoldUserStatus() {
         for (var i = 0; i < 4; i++) {
             seed(source().toBuilder().keyId("key-" + i).keyHash("hash-" + i).build(), true);
@@ -240,7 +338,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
         seed(source, false);
         var interrupted = spy(dao);
         doAnswer(call -> { throw new IllegalStateException("account copy interrupted"); })
-                .when(interrupted).copy(any(), anyLong());
+                .when(interrupted).copy(any(), any(TimedRow.class));
 
         task(interrupted).run(() -> { });
 
@@ -413,7 +511,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
             template.insert(ownerConverter.voToModel(updated), insertAt(timestamp + 10));
             dao.copy(accountConverter.voToModel(target(updated)), timestamp + 10);
             return call.callRealMethod();
-        }).when(racing).copy(any(), anyLong());
+        }).when(racing).copy(any(), any(TimedRow.class));
 
         task(racing).run(() -> { });
 
@@ -437,7 +535,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
             template.delete(accountModel(source), deleteAt(timestamp + 10));
             template.delete(KeyModel.builder().keyHash(source.getKeyHash()).build(), deleteAt(timestamp + 10));
             return call.callRealMethod();
-        }).when(racing).copy(any(), anyLong());
+        }).when(racing).copy(any(), any(TimedRow.class));
 
         task(racing).run(() -> { });
 

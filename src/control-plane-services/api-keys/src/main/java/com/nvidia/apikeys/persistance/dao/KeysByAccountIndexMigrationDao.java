@@ -32,7 +32,10 @@ import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.api.trace.StatusCode;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Supplier;
@@ -42,6 +45,7 @@ import org.springframework.data.cassandra.core.CassandraTemplate;
 import org.springframework.data.cassandra.core.DeleteOptions;
 import org.springframework.data.cassandra.core.InsertOptions;
 import org.springframework.stereotype.Service;
+import org.springframework.util.Assert;
 
 @Service
 @RequiredArgsConstructor
@@ -53,7 +57,11 @@ public class KeysByAccountIndexMigrationDao {
     private final KeyRepository keyRepository;
     private final OpenTelemetry openTelemetry;
 
-    public record TimedRow<T>(T model, long timestamp) { }
+    public record TimedRow<T>(T model, long timestamp, Map<String, Long> writeTimes) {
+        public TimedRow(T model, long timestamp) {
+            this(model, timestamp, Map.of());
+        }
+    }
     public record Page<T>(List<TimedRow<T>> rows, ByteBuffer nextPage) { }
 
     public Page<KeyByOwnerAndServiceModel> ownerPage(ByteBuffer pagingState, int pageSize) {
@@ -146,7 +154,40 @@ public class KeysByAccountIndexMigrationDao {
 
     public void copy(KeyByOwnerAndAccountAndServiceModel model, long timestamp) {
         traced("copy-account", () -> template.insert(model,
-                InsertOptions.builder().timestamp(timestamp).idempotent(true).build()));
+                InsertOptions.builder().timestamp(timestamp).withInsertNulls(false).idempotent(true).build()));
+    }
+
+    public void copy(KeyByOwnerAndAccountAndServiceModel model, TimedRow<KeyByOwnerAndServiceModel> source) {
+        var writes = new LinkedHashMap<Long, KeyByOwnerAndAccountAndServiceModel>();
+        var times = source.writeTimes();
+        var detailsTime = times.get(KeyByOwnerAndServiceModel.COLUMN_KEY_DETAILS);
+        Assert.notNull(detailsTime, "Source key details must have a write timestamp");
+        // Write decryptable details first so an interrupted copy can be repaired on the next scan.
+        var details = copyAt(writes, model, detailsTime);
+        details.setKeyDetails(model.getKeyDetails());
+        details.setCreatedAt(model.getCreatedAt());
+        if (times.containsKey(KeyByOwnerAndServiceModel.COLUMN_KEY_STATUS)) {
+            copyAt(writes, model, times.get(KeyByOwnerAndServiceModel.COLUMN_KEY_STATUS))
+                    .setKeyStatus(model.getKeyStatus());
+        }
+        if (times.containsKey(KeyByOwnerAndServiceModel.COLUMN_EXPIRES_AT)) {
+            copyAt(writes, model, times.get(KeyByOwnerAndServiceModel.COLUMN_EXPIRES_AT))
+                    .setExpiresAt(model.getExpiresAt());
+        }
+        if (times.containsKey(KeyByOwnerAndServiceModel.COLUMN_DELETES_AT)) {
+            copyAt(writes, model, times.get(KeyByOwnerAndServiceModel.COLUMN_DELETES_AT))
+                    .setDeletesAt(model.getDeletesAt());
+        }
+        // Unset fields stay absent; never fabricate a timestamp for a null source cell.
+        writes.forEach((timestamp, partial) -> copy(partial, timestamp));
+    }
+
+    private KeyByOwnerAndAccountAndServiceModel copyAt(
+            Map<Long, KeyByOwnerAndAccountAndServiceModel> writes,
+            KeyByOwnerAndAccountAndServiceModel key, long timestamp) {
+        return writes.computeIfAbsent(timestamp, ignored -> KeyByOwnerAndAccountAndServiceModel.builder()
+                .ncaId(key.getNcaId()).ownerType(key.getOwnerType()).ownerId(key.getOwnerId())
+                .issuerServiceId(key.getIssuerServiceId()).keyId(key.getKeyId()).build());
     }
 
     public void deleteOrphan(KeyByOwnerAndAccountAndServiceModel model, long timestamp) {
@@ -177,11 +218,13 @@ public class KeysByAccountIndexMigrationDao {
     }
 
     private <T> TimedRow<T> map(Row row, Class<T> type) {
-        var timestamp = StreamSupport.stream(row.getColumnDefinitions().spliterator(), false)
+        var writeTimes = new HashMap<String, Long>();
+        StreamSupport.stream(row.getColumnDefinitions().spliterator(), false)
                 .map(column -> column.getName().asInternal())
                 .filter(column -> column.startsWith("wt_") && !row.isNull(column))
-                .mapToLong(row::getLong).max().orElse(0);
-        return new TimedRow<>(template.getConverter().read(type, row), timestamp);
+                .forEach(column -> writeTimes.put(column.substring(3), row.getLong(column)));
+        var timestamp = writeTimes.values().stream().mapToLong(Long::longValue).max().orElse(0);
+        return new TimedRow<>(template.getConverter().read(type, row), timestamp, Map.copyOf(writeTimes));
     }
 
     private <T> T traced(String operation, Supplier<T> action) {
