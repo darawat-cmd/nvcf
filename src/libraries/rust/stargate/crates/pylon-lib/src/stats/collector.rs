@@ -88,6 +88,8 @@ pub fn stats_aggregator_update_channel(
 #[derive(Clone)]
 pub(crate) struct StatsCollectorControl {
     tx: flume::Sender<StatsCollectorCommand>,
+    /// Cancelled when the collector task ends, however it ends.
+    exited: CancellationToken,
 }
 
 pub struct StatsCollectorHandle {
@@ -144,13 +146,15 @@ impl StatsCollectorControl {
         initialization: ModelStatsInitialization,
     ) -> Result<bool, StatsCollectorStopped> {
         let (reply, acknowledged) = oneshot::channel();
-        self.send(StatsCollectorCommand::Begin {
-            generation,
-            initialization,
-            reply,
-        })
-        .await?;
-        acknowledged.await.map_err(|_| StatsCollectorStopped)
+        self.request(
+            StatsCollectorCommand::Begin {
+                generation,
+                initialization,
+                reply,
+            },
+            acknowledged,
+        )
+        .await
     }
 
     /// Flushes queued observation and engine-stats events into the aggregator,
@@ -161,12 +165,14 @@ impl StatsCollectorControl {
         generation: &ModelGeneration,
     ) -> Result<Option<CurrentModelStats>, StatsCollectorStopped> {
         let (reply, acknowledged) = oneshot::channel();
-        self.send(StatsCollectorCommand::Snapshot {
-            generation: generation.clone(),
-            reply,
-        })
-        .await?;
-        acknowledged.await.map_err(|_| StatsCollectorStopped)
+        self.request(
+            StatsCollectorCommand::Snapshot {
+                generation: generation.clone(),
+                reply,
+            },
+            acknowledged,
+        )
+        .await
     }
 
     pub(crate) async fn retire_generation(
@@ -174,19 +180,36 @@ impl StatsCollectorControl {
         generation: &ModelGeneration,
     ) -> Result<bool, StatsCollectorStopped> {
         let (reply, acknowledged) = oneshot::channel();
-        self.send(StatsCollectorCommand::Retire {
-            generation: generation.clone(),
-            reply,
-        })
-        .await?;
-        acknowledged.await.map_err(|_| StatsCollectorStopped)
+        self.request(
+            StatsCollectorCommand::Retire {
+                generation: generation.clone(),
+                reply,
+            },
+            acknowledged,
+        )
+        .await
     }
 
-    async fn send(&self, command: StatsCollectorCommand) -> Result<(), StatsCollectorStopped> {
-        self.tx
-            .send_async(command)
-            .await
-            .map_err(|_| StatsCollectorStopped)
+    /// Sends `command` and waits for its reply, or until the collector exits.
+    /// The collector checks its stop before its queue, so it can exit with a
+    /// command unread. The channel keeps that command, and with it the reply
+    /// sender, while any sender lives, so the reply alone could wait forever.
+    async fn request<T>(
+        &self,
+        command: StatsCollectorCommand,
+        acknowledged: oneshot::Receiver<T>,
+    ) -> Result<T, StatsCollectorStopped> {
+        let exchange = async {
+            self.tx
+                .send_async(command)
+                .await
+                .map_err(|_| StatsCollectorStopped)?;
+            acknowledged.await.map_err(|_| StatsCollectorStopped)
+        };
+        tokio::select! {
+            result = exchange => result,
+            () = self.exited.cancelled() => Err(StatsCollectorStopped),
+        }
     }
 }
 
@@ -299,7 +322,10 @@ pub fn start_stats_collector_with_engine_stats(
             .expect("distinct runtime models should initialize once");
     }
     let (control_tx, control_rx) = flume::bounded(aggregator.config.observation_channel_capacity);
+    let exited = CancellationToken::new();
+    let exited_guard = exited.clone().drop_guard();
     let task = OwnedTask::spawn("stats collector", move |stop| async move {
+        let _exited = exited_guard;
         run_stats_collector(
             aggregator,
             observation_rx,
@@ -311,7 +337,10 @@ pub fn start_stats_collector_with_engine_stats(
     });
     StatsCollectorHandle {
         task,
-        control: StatsCollectorControl { tx: control_tx },
+        control: StatsCollectorControl {
+            tx: control_tx,
+            exited,
+        },
     }
 }
 
@@ -4082,6 +4111,39 @@ mod tests {
             StatsAggregator::new(StatsCollectorConfig::default(), runtime_state)
                 .apply_kv_cache_stats(kv_cache_stats("model-b"))
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn request_queued_as_the_collector_stops_returns_instead_of_hanging() {
+        let config = config!(observation_channel_capacity: 16);
+        let (runtime_state, observation_rx) = PylonRuntimeState::observed(
+            stargate_proto::pb::InferenceServerStatus::Active,
+            &[],
+            config.observation_channel_capacity,
+            None,
+        );
+        let collector = start_stats_collector(config, observation_rx, runtime_state);
+        let control = collector.control();
+        let generation = crate::runtime_state::ModelGeneration::new("model-a", 1);
+
+        // Stop the collector, then queue a command before it runs again. It
+        // checks its stop first, so it exits without answering the command.
+        let shutdown = collector.shutdown();
+        tokio::pin!(shutdown);
+        assert!(futures::poll!(&mut shutdown).is_pending());
+        let retire = control.retire_generation(&generation);
+        tokio::pin!(retire);
+        assert!(futures::poll!(&mut retire).is_pending());
+
+        let (retired, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(1), retire),
+            shutdown
+        );
+        assert!(
+            retired
+                .expect("a request queued as the collector stops should not hang")
+                .is_err()
         );
     }
 
