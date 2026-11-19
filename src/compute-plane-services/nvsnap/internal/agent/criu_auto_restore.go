@@ -101,7 +101,10 @@ type criuAutoRestorer struct {
 	// readyObserved: pod UID -> struct{}: its start was recorded
 	// (lifecycle_metrics.go); pods Ready before watchStart are not.
 	readyObserved sync.Map
-	watchStart    time.Time
+	// companionFailures: leader pod UID -> int: its instance's companions
+	// could not be told this many times in a row (criu_group.go).
+	companionFailures sync.Map
+	watchStart        time.Time
 
 	mu        sync.Mutex
 	blocked   map[string]bool
@@ -173,6 +176,7 @@ func (c *criuAutoRestorer) consider(ctx context.Context, pod *corev1.Pod) {
 	c.considerRestoredCondition(ctx, pod)
 	c.considerColdStart(ctx, pod)
 	c.considerRestoredStacks(ctx, pod)
+	c.considerTeardown(ctx, pod)
 	c.observePodReady(ctx, pod)
 	if !c.admitted(ctx, pod) {
 		return
@@ -250,6 +254,7 @@ func (c *criuAutoRestorer) prefetch(ctx context.Context, pod *corev1.Pod) {
 }
 
 func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid types.UID, id, container, groupKey string) {
+	defer metrics.Active("restore")()
 	a := c.a
 	log := a.log.WithFields(logrus.Fields{"pod": ns + "/" + pod, "checkpoint": id, "container": container})
 	rctx, cancel := context.WithTimeout(ctx, criuAutoRestoreTimeout)
@@ -257,6 +262,11 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 	t0 := time.Now()
 	ref := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: pod, UID: uid}}
 	err := func() error {
+		if why := c.driverMismatch(rctx, groupKey); why != "" {
+			// Not run, and not held against the capture: the replacement is
+			// admitted under the cluster's drivers as they are now.
+			return fmt.Errorf("%w: %s", errCheckpointUnavailable, why)
+		}
 		_, err := a.restoreProbed(rctx, RestoreRequest{
 			CheckpointID:             id,
 			PlaceholderNamespace:     ns,
@@ -281,7 +291,7 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 		took, now := time.Since(t0), time.Now()
 		record(func(d map[string]string) bool {
 			changed := recordRestored(d, id, string(uid)+"/"+container)
-			return recordRestoreHistory(d, id, now, took) || changed
+			return recordRestoreHistory(d, id, now, took, uid) || changed
 		})
 		return
 	}
@@ -441,6 +451,22 @@ func (a *Agent) recordCRIUCapture(ctx context.Context, hash, checkpointID string
 			m.SourcePodMeta[webhook.ColdEntrypointMeta] = string(b)
 		}
 	}
+	pc, err := a.podProcessConfig(ctx, req.Namespace, req.PodName)
+	if err != nil {
+		log.WithError(err).Warn("CRIU capture not recorded: cannot read the pod's process configuration; pods restoring from it will start fresh")
+		return
+	}
+	if pc != "" {
+		// A pod restores from it only with the same process configuration
+		// of the checkpointed container (of every container when the
+		// request names none).
+		if req.ContainerName != "" {
+			pc = webhook.ProcessConfigOf(pc, req.ContainerName)
+		}
+		if pc != "" {
+			m.SourcePodMeta[webhook.ProcessConfigMeta] = pc
+		}
+	}
 	if req.CaptureID != "" {
 		m.SourcePodMeta[checkpointstore.InstanceCaptureMetaKey] = "true"
 	}
@@ -468,14 +494,18 @@ func (c *criuAutoRestorer) recordLoneRestore(ctx context.Context, ns, pod, id, c
 
 // markRestored annotates a restored placeholder so a restarted agent does
 // not restore into it again (and, refused, delete it), and lets its
-// readiness pass (restored_condition.go).
+// readiness pass (restored_condition.go). The annotation comes first: the
+// condition makes the pod Ready, and the pod's start is recorded from the
+// first event that shows it Ready (observePodReady), which must already
+// say the pod was restored. A condition that fails here is set on the
+// pod's next event, from the annotation.
 func (a *Agent) markRestored(ctx context.Context, ns, pod string, log *logrus.Entry) {
-	if err := a.setRestoredCondition(ctx, ns, pod); err != nil {
-		log.WithError(err).Warn("CRIU restore: could not set the pod's restored condition; the agent sets it on the pod's next event")
-	}
 	patch := fmt.Sprintf(`{"metadata":{"annotations":{%q:%q}}}`, webhook.CRIURestoredAnnotation, time.Now().UTC().Format(time.RFC3339))
 	if _, err := a.kubeClient.CoreV1().Pods(ns).Patch(ctx, pod, types.MergePatchType, []byte(patch), metav1.PatchOptions{}); err != nil && !apierrors.IsNotFound(err) {
 		log.WithError(err).Warn("CRIU restore: could not mark the pod restored; an agent restart may try it again")
+	}
+	if err := a.setRestoredCondition(ctx, ns, pod); err != nil {
+		log.WithError(err).Warn("CRIU restore: could not set the pod's restored condition; the agent sets it on the pod's next event")
 	}
 }
 

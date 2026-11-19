@@ -43,7 +43,10 @@ const (
 	// (/checkpoints/<id>), the same path the agent's placeholder uses.
 	criuCheckpointsMount = "/checkpoints"
 
-	restoreWorkVolume = "nvsnap-restore-work"
+	restoreWorkVolume = RestoreWorkVolume
+	// RestoreWorkVolume names the placeholder's work volume, an emptyDir the
+	// node's agent also reaches through the kubelet's pod directory.
+	RestoreWorkVolume = "nvsnap-restore-work"
 	// RestoreWorkMountPath is the placeholder's own writable directory for
 	// what a restore writes: CRIU's log and stats (criu -W) and a group
 	// restore's session. The checkpoint itself is mounted read-only: later
@@ -63,6 +66,20 @@ const (
 	// ColdStartedAnnotation marks a placeholder whose restore failed and
 	// that the agent started cold in place, with the time it did.
 	ColdStartedAnnotation = "nvsnap.io/criu-cold-started"
+
+	// TeardownHoldFile is the agent's hold on a restored group rank's
+	// placeholder, on its work volume: once its workload has gone, the
+	// placeholder stays until the agent removes it, once every rank of the
+	// group has exited, so no node leaves the group's fabric while a peer
+	// still holds memory imported from it (docs/design/GROUP-TEARDOWN.md).
+	// cmd/nvsnap-idle names it too.
+	TeardownHoldFile = "teardown-hold"
+	// TeardownExitedFile is the placeholder's report, on its work volume,
+	// that its workload has gone. cmd/nvsnap-idle names it too.
+	TeardownExitedFile = "teardown-exited"
+	// TeardownExitedAnnotation marks a terminating restored rank whose
+	// workload has exited, for the other ranks' agents.
+	TeardownExitedAnnotation = "nvsnap.io/criu-teardown-exited"
 )
 
 // criuCheckpointID returns the CRIU checkpoint a capture record points to,
@@ -110,6 +127,11 @@ func (m *Mutator) criuRestoreFor(ctx context.Context, pod *corev1.Pod, hash stri
 	}
 	if m.CRIURestoreBlocked != nil && m.CRIURestoreBlocked(ctx, id) {
 		log.WithField("checkpoint", id).Warn("CRIU restore: this checkpoint failed to restore before; cold start")
+		return "", man
+	}
+	if changed := ProcessConfigChanges(man.SourcePodMeta[ProcessConfigMeta], ProcessConfig(pod)); len(changed) > 0 {
+		log.WithFields(logrus.Fields{"checkpoint": id, "changed": strings.Join(changed, ", ")}).
+			Info("CRIU restore: the pod's process configuration differs from its checkpoint's, which the restored process would keep; cold start")
 		return "", man
 	}
 	return id, man

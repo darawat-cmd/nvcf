@@ -40,9 +40,46 @@ When enabled, the stack creates:
 - `llm-api-gateway` in the `nvcf` namespace.
 - `llm-request-router` in the `nvcf` namespace.
 - The `llm.<domain>` and `llm.invocation.<domain>` HTTPRoutes when Gateway API
-  ingress is enabled.
+  ingress is enabled. To skip either route, for example when callers reach the
+  gateway in-cluster, set `ingress.gatewayApi.routes.llmApiGateway.enabled` or
+  `ingress.gatewayApi.routes.llmInvocation.enabled` to `false`.
 - LLM worker pods with a `pylon` sidecar that forwards requests to the function
   container on the configured `inferencePort`.
+
+When a worker pod of a container-based LLM function is removed, for example on
+scale-down, the function container gets a `preStop` pause before its stop
+signal, so it keeps serving requests while the `pylon` sidecar stops. The
+pause is 60 seconds by default. The pod's termination grace period is the
+pause plus 60 seconds, or 120 seconds if that is longer, and the `pylon`
+sidecar gets `PYLON_SHUTDOWN_DRAIN_TIMEOUT_MS` set to the pause minus 5
+seconds; a `pylon` version that reads this variable uses it as its drain
+deadline. A removed pod therefore releases its GPU up to one pause later. To
+change the pause, set `worker.llmInferenceStopPause` in the `nvca-operator`
+chart values, for example `90s`, between `10s` and `1h`; it applies to worker
+pods created after NVCA picks up the new value. The pause runs `sleep` in the
+function container; an image without `sleep` stops at once, as before. When
+the function uses Bring Your Own Observability (BYOO), the BYOO collector and
+log-forwarder sidecars wait for the same pause, so telemetry from requests
+served during the pause is still sent. They use the Kubernetes `sleep`
+lifecycle action, which is stable since Kubernetes 1.34. The function
+container's own shutdown output after the pause may not be sent.
+
+A new worker registers with `llm-request-router` at a fixed 100 input tokens
+per second. To start it at a measured rate instead, set
+`PYLON_DO_CALIBRATION: "true"` in `agent.functionEnvOverrides` of the
+`nvca-operator` chart values. `pylon` then measures each model's input rate
+before it registers. Older `pylon` versions ignore this variable and start at
+100. A model whose calibration fails starts at 100 and logs a warning.
+Calibration adds about 5 to 15 seconds per model name to worker startup. The
+worker pod can be Ready during that time. If the function has no other
+registered worker, a request then gets `404` with `no_eligible_candidates`.
+
+To change the time limit for each calibration load step, 5 seconds by default,
+set `PYLON_BRINGUP_CALIBRATION_TIMEOUT_MS` there. `PYLON_DO_CALIBRATION` must
+be `true` or `false`, and `PYLON_BRINGUP_CALIBRATION_TIMEOUT_MS` must be a
+positive number of milliseconds. The overrides apply to every LLM function on
+the cluster, so an invalid value stops `pylon` on every new LLM worker there.
+Both variables apply to worker pods created after NVCA picks up the new values.
 
 ## Enable on an Existing Installation
 

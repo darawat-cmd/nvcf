@@ -372,7 +372,7 @@ fn watch_snapshot(routers: &[&str], watch_urls: &[&str]) -> WatchEndpointSnapsho
     }
 }
 
-fn test_registration_config() -> InferenceServerRegistrationConfig {
+pub(super) fn test_registration_config() -> InferenceServerRegistrationConfig {
     InferenceServerRegistrationConfig {
         seeds: vec!["router-a".to_string()],
         inference_server_id: "inst-a".to_string(),
@@ -393,6 +393,7 @@ fn test_registration_config() -> InferenceServerRegistrationConfig {
         quic_insecure: true,
         tunnel_protocol: TunnelTransportProtocol::RawQuic,
         auth_token_provider: None,
+        shutdown_drain_timeout: crate::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
     }
 }
 
