@@ -1736,12 +1736,15 @@ mod tests {
         upstream_failing: Arc<AtomicBool>,
     ) -> (TestHttpServer, ReadinessGateProbes) {
         let remaining = Arc::new(AtomicUsize::new(not_ready_probes));
+        let total = Arc::new(AtomicUsize::new(0));
         let server_remaining = remaining.clone();
+        let server_total = total.clone();
         let server = TestHttpServer::spawn(Router::new().route(
             "/ready",
             get(move || {
                 let remaining = server_remaining.clone();
                 let upstream_failing = upstream_failing.clone();
+                server_total.fetch_add(1, Ordering::SeqCst);
                 async move {
                     if remaining.load(Ordering::SeqCst) > 0 {
                         remaining.fetch_sub(1, Ordering::SeqCst);
@@ -1753,14 +1756,21 @@ mod tests {
             }),
         ))
         .await;
-        (server, ReadinessGateProbes(remaining))
+        (server, ReadinessGateProbes { remaining, total })
     }
 
-    struct ReadinessGateProbes(Arc<AtomicUsize>);
+    struct ReadinessGateProbes {
+        remaining: Arc<AtomicUsize>,
+        total: Arc<AtomicUsize>,
+    }
 
     impl ReadinessGateProbes {
         fn not_ready_left(&self) -> usize {
-            self.0.load(Ordering::SeqCst)
+            self.remaining.load(Ordering::SeqCst)
+        }
+
+        fn total(&self) -> usize {
+            self.total.load(Ordering::SeqCst)
         }
     }
 
@@ -1796,6 +1806,9 @@ mod tests {
         .expect("startup should wait for the declared health check");
 
         assert_eq!(probes.not_ready_left(), 0);
+        // One passing probe ends the startup wait; with bringup off no model
+        // probes again.
+        assert_eq!(probes.total(), 3 + 1);
         assert_eq!(runtime_state.advertised_model_ids(), ["model-a"]);
 
         lifecycle.shutdown().await;
