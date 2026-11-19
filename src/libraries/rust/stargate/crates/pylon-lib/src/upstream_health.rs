@@ -32,8 +32,6 @@ const UNRESOLVED: usize = usize::MAX;
 pub enum ReadinessGateError {
     #[error("invalid upstream URL for the readiness gate: {0}")]
     Url(#[from] url::ParseError),
-    #[error("readiness gate needs a health path")]
-    EmptyPath,
     #[error("upstream URL {0} cannot take a health port")]
     PortNotSupported(String),
     #[error("readiness gate expected status {0} is not an HTTP status code")]
@@ -53,17 +51,18 @@ pub struct ReadinessGate {
 }
 
 impl ReadinessGate {
-    /// `port` is the declared health port; `None` uses the upstream's port.
+    /// `port` is the declared health port; `None` uses the upstream's port. An
+    /// empty `path` is the control-plane default, as in the `utils` worker.
     pub fn new(
         upstream_http_base_url: &str,
         path: &str,
         port: Option<u16>,
         expected_status: u16,
     ) -> Result<Self, ReadinessGateError> {
-        let path = normalize_path(path);
-        if path.is_empty() {
-            return Err(ReadinessGateError::EmptyPath);
-        }
+        let path = match normalize_path(path) {
+            path if path.is_empty() => CONTROL_PLANE_DEFAULT_HEALTH_PATH.to_string(),
+            path => path,
+        };
         let expected_status = StatusCode::from_u16(expected_status)
             .map_err(|_| ReadinessGateError::InvalidStatus(expected_status))?;
         let mut url = Url::parse(upstream_http_base_url)?;
@@ -90,18 +89,17 @@ impl ReadinessGate {
         self.expected_status
     }
 
-    /// Whether a 404 falls back to the lenient probe; logs the first fallback.
-    pub(crate) fn not_found_falls_back(&self) -> bool {
-        if !self.is_control_plane_default {
-            return false;
-        }
+    pub(crate) fn is_control_plane_default(&self) -> bool {
+        self.is_control_plane_default
+    }
+
+    pub(crate) fn log_fallback_once(&self) {
         if !self.fallback_logged.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 url = %self.url,
                 "upstream does not serve the default health check; using the fallback health paths"
             );
         }
-        true
     }
 }
 
@@ -262,20 +260,23 @@ mod tests {
                 "http://frontend:8001/v2/health/ready",
                 false,
             ),
+            (
+                "empty path",
+                " ",
+                None,
+                "http://frontend:8000/v2/health/ready",
+                true,
+            ),
         ] {
             let gate = ReadinessGate::new("http://frontend:8000", path, port, 200).expect(label);
 
             assert_eq!(gate.url(), expected_url, "{label}");
-            assert_eq!(gate.not_found_falls_back(), is_default, "{label}");
+            assert_eq!(gate.is_control_plane_default(), is_default, "{label}");
         }
     }
 
     #[test]
-    fn readiness_gate_rejects_an_empty_path_and_an_invalid_status() {
-        assert!(matches!(
-            ReadinessGate::new("http://frontend:8000", " ", None, 200),
-            Err(ReadinessGateError::EmptyPath)
-        ));
+    fn readiness_gate_rejects_an_invalid_status() {
         assert!(matches!(
             ReadinessGate::new("http://frontend:8000", "/ready", None, 1000),
             Err(ReadinessGateError::InvalidStatus(1000))

@@ -62,9 +62,8 @@ const (
 	llmWorkerShutdownAllowance   = 5 * time.Second
 	llmInferenceExitAllowance    = 60 * time.Second
 
-	// With this switch on, Pylon waits for the function's declared health
-	// check and serves the result on /ready. Operators turn it on per cluster
-	// through functionEnvOverrides; a Pylon without /ready never becomes Ready.
+	// Set per cluster through functionEnvOverrides. A Pylon without /ready
+	// answers 404, so its worker never becomes Ready.
 	llmReadinessGateEnv = "PYLON_READINESS_GATE"
 	llmReadinessPath    = "/ready"
 )
@@ -161,8 +160,9 @@ func upstreamHealthPath(allEnvSet map[string]string) string {
 // status, on Pylon's /ready. Pylon has no gRPC prober, so a gRPC health check
 // gets no probe.
 func llmWorkerReadinessProbe(allEnvSet map[string]string) *corev1.Probe {
-	isGateOn, err := strconv.ParseBool(strings.TrimSpace(allEnvSet[llmReadinessGateEnv]))
-	if err != nil || !isGateOn {
+	// Pylon accepts only "true" or "false" and exits on any other value, so
+	// only the exact value Pylon reads as on adds the probe.
+	if allEnvSet[llmReadinessGateEnv] != "true" {
 		return nil
 	}
 	if strings.EqualFold(strings.TrimSpace(allEnvSet["INFERENCE_HEALTH_PROTOCOL"]), "grpc") {

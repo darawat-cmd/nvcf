@@ -87,10 +87,11 @@ function version can become `ACTIVE` before its model workers load. To hold
 readiness until the function's health check passes, set
 `PYLON_READINESS_GATE: "true"` in `agent.functionEnvOverrides`. `pylon` then
 waits for the health check declared on the function, with its path, port, and
-expected status, before it calibrates and registers. NVCA adds a readiness probe
-on `pylon`'s `/ready`, so the worker is Ready, and the version `ACTIVE`, only
-after that check passes and `pylon` has registered. The worker still has
-`INFERENCE_READY_TIMEOUT` to pass, as other functions do.
+expected status. Only after that check passes does `pylon` calibrate and
+register. NVCA adds a readiness probe on `pylon`'s `/ready`. The worker becomes
+Ready, and the version `ACTIVE`, only after `pylon` has registered. The worker
+still has `INFERENCE_READY_TIMEOUT` to pass, as other functions do.
+`PYLON_READINESS_GATE` must be `true` or `false`; any other value stops `pylon`.
 
 - Declare a health check that waits for the model workers, for example a
   sidecar that answers `200` only when enough workers are ready. A function with
@@ -99,10 +100,10 @@ after that check passes and `pylon` has registered. The worker still has
   health paths, so readiness does not wait for the workers.
 - Functions with a gRPC health check keep the current behavior and get no
   readiness probe.
-- Turn the switch on only when every LLM worker on the cluster runs a `pylon`
-  that serves `/ready`. An older `pylon` answers `404` there, so its workers
-  never become Ready and are removed when the startup timeout ends. Turn the
-  switch off before you roll `pylon` back to such a version.
+- Enable the switch only when every LLM worker on the cluster runs a `pylon`
+  that serves `/ready`. An older `pylon` answers `404` there. Its workers never
+  become Ready and are removed when the startup timeout ends. Disable the
+  switch before you roll `pylon` back to such a version.
 
 ## Enable on an Existing Installation
 

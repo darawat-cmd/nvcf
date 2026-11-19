@@ -462,8 +462,10 @@ func TestLLMWorkerReadinessProbe(t *testing.T) {
 		{name: "switch unset", gate: "", protocol: "HTTP", hasReadiness: false},
 		{name: "switch off", gate: "false", protocol: "HTTP", hasReadiness: false},
 		{name: "switch not a boolean", gate: "yes", protocol: "HTTP", hasReadiness: false},
+		{name: "Go boolean that Pylon rejects", gate: "1", protocol: "HTTP", hasReadiness: false},
+		{name: "upper case that Pylon rejects", gate: "TRUE", protocol: "HTTP", hasReadiness: false},
 		{name: "switch on", gate: "true", protocol: "HTTP", hasReadiness: true},
-		{name: "switch on, protocol unset", gate: "1", protocol: "", hasReadiness: true},
+		{name: "switch on, protocol unset", gate: "true", protocol: "", hasReadiness: true},
 		{name: "switch on, gRPC health check", gate: "true", protocol: "gRPC", hasReadiness: false},
 	}
 

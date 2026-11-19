@@ -66,9 +66,11 @@ pub(crate) async fn check_readiness_gate(
     if status == gate.expected_status() {
         return true;
     }
-    status == StatusCode::NOT_FOUND
-        && gate.not_found_falls_back()
-        && check_upstream_health(http_client, upstream_http_base_url, timeout, fallback_paths).await
+    if status != StatusCode::NOT_FOUND || !gate.is_control_plane_default() {
+        return false;
+    }
+    gate.log_fallback_once();
+    check_upstream_health(http_client, upstream_http_base_url, timeout, fallback_paths).await
 }
 
 async fn ensure_success(response: reqwest::Response) -> Result<reqwest::Response, BringupError> {

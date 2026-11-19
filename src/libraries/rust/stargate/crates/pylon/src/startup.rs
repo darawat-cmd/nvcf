@@ -263,8 +263,7 @@ fn readiness_gate_from_args(args: &Args) -> Result<(Option<ReadinessGate>, Optio
     if !protocol.eq_ignore_ascii_case("http") {
         return Ok((None, Some(protocol.to_string())));
     }
-    let path = non_empty(&args.readiness_health_path)
-        .context("--readiness-gate needs --readiness-health-path or INFERENCE_HEALTH_ENDPOINT")?;
+    let path = non_empty(&args.readiness_health_path).unwrap_or_default();
     let port = non_empty(&args.readiness_health_port)
         .map(|port| {
             port.parse::<u16>()
@@ -279,6 +278,7 @@ fn readiness_gate_from_args(args: &Args) -> Result<(Option<ReadinessGate>, Optio
                 .with_context(|| format!("invalid readiness health status {status:?}"))
         })
         .transpose()?
+        .filter(|status| *status != 0)
         .unwrap_or(DEFAULT_READINESS_HEALTH_STATUS);
     let gate = ReadinessGate::new(
         &normalize_base_url(&args.upstream_http_base_url),
@@ -1073,6 +1073,16 @@ mod tests {
                 None,
             ),
             (
+                "no path and status 0 use the NVCF defaults",
+                &[
+                    "--readiness-gate",
+                    "--readiness-health-expected-status",
+                    "0",
+                ][..],
+                Some("http://127.0.0.1:8090/v2/health/ready"),
+                None,
+            ),
+            (
                 "gRPC keeps the upstream health paths",
                 &[
                     "--readiness-gate",
@@ -1101,9 +1111,8 @@ mod tests {
     }
 
     #[test]
-    fn readiness_gate_rejects_missing_or_malformed_settings_when_switched_on() {
+    fn readiness_gate_rejects_malformed_settings_when_switched_on() {
         for (label, extra) in [
-            ("no path", &["--readiness-gate"][..]),
             (
                 "bad port",
                 &[
