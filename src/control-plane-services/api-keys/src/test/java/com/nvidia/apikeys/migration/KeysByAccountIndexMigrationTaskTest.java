@@ -31,10 +31,11 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
+import com.nvidia.apikeys.config.KeysByAccountIndexMigrationProperties;
 import com.nvidia.apikeys.config.NakProperties;
-import com.nvidia.apikeys.persistance.dao.KeysByAccountIndexMigrationDao;
 import com.nvidia.apikeys.persistance.dao.KeysByAccountIndexMigrationDao.Page;
 import com.nvidia.apikeys.persistance.dao.KeysByAccountIndexMigrationDao.TimedRow;
+import com.nvidia.apikeys.persistance.dao.KeysByAccountIndexMigrationDao;
 import com.nvidia.apikeys.persistance.dao.RowUpdateLockDao;
 import com.nvidia.apikeys.persistance.models.KeyByOwnerAndAccountAndServiceModel;
 import com.nvidia.apikeys.persistance.models.KeyByOwnerAndServiceModel;
@@ -77,6 +78,7 @@ class KeysByAccountIndexMigrationTaskTest {
             KeyByOwnerAndAccountAndServiceVo> accountConverter;
 
     private NakProperties properties;
+    private KeysByAccountIndexMigrationProperties migrationProperties;
     private PrometheusMeterRegistry registry;
     private KeysByAccountIndexMigrationTask task;
     private final AtomicBoolean completed = new AtomicBoolean();
@@ -84,11 +86,12 @@ class KeysByAccountIndexMigrationTaskTest {
     @BeforeEach
     void setUp() {
         properties = NakProperties.builder().ncaId("configured-nca").build();
-        var config = properties.getMigration().getKeysByAccountIndex();
+        migrationProperties = new KeysByAccountIndexMigrationProperties();
+        var config = migrationProperties;
         config.setSettleDelay(Duration.ZERO);
         config.setBatchDelay(Duration.ZERO);
         registry = new PrometheusMeterRegistry(PrometheusConfig.DEFAULT);
-        task = new KeysByAccountIndexMigrationTask(dao, markers, properties, services,
+        task = new KeysByAccountIndexMigrationTask(dao, markers, properties, migrationProperties, services,
                 ownerConverter, accountConverter, registry, OpenTelemetry.noop(),
                 Clock.fixed(TEST_TIME, ZoneOffset.UTC));
         when(markers.isCompleted(anyString(), anyString())).thenAnswer(invocation -> completed.get());
@@ -97,7 +100,7 @@ class KeysByAccountIndexMigrationTaskTest {
 
     @Test
     void disabledTaskDoesNotScan() {
-        properties.getMigration().getKeysByAccountIndex().setEnabled(false);
+        migrationProperties.setEnabled(false);
 
         task.run(() -> { });
 

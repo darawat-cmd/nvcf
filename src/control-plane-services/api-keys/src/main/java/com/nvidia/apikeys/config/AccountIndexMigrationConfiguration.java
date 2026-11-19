@@ -29,17 +29,17 @@ import org.springframework.scheduling.annotation.EnableScheduling;
 @Configuration
 @EnableScheduling
 @EnableSchedulerLock(defaultLockAtMostFor = "PT5M")
-@ConditionalOnProperty(prefix = "apikeys.migration.keys-by-account-index",
+@ConditionalOnProperty(prefix = "account-index-migration",
         name = "enabled", havingValue = "true", matchIfMissing = true)
 public class AccountIndexMigrationConfiguration {
     @Bean
-    public LockProvider accountIndexMigrationLockProvider(CqlSession session, NakProperties properties) {
-        var config = properties.getMigration().getKeysByAccountIndex();
+    public LockProvider accountIndexMigrationLockProvider(
+            CqlSession session, KeysByAccountIndexMigrationProperties properties) {
         return new CassandraLockProvider(CassandraLockProvider.Configuration.builder()
                 .withCqlSession(session)
                 .withTableName("lock")
-                .withConsistencyLevel(config.getLockConsistency())
-                .withSerialConsistencyLevel(config.getLockSerialConsistency())
+                .withConsistencyLevel(properties.getLockConsistency())
+                .withSerialConsistencyLevel(properties.getLockSerialConsistency())
                 .build());
     }
 }

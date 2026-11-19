@@ -59,19 +59,6 @@ public class NakProperties {
     @Builder.Default
     private String tieredRateLimitRuleName = "apikey.account_rate_limit";
 
-    @Valid
-    @NestedConfigurationProperty
-    @Builder.Default
-    private MigrationProperties migration = new MigrationProperties();
-
-    @Data
-    public static class MigrationProperties {
-        @Valid
-        @NestedConfigurationProperty
-        private KeysByAccountIndexMigrationProperties keysByAccountIndex =
-                new KeysByAccountIndexMigrationProperties();
-    }
-
     // api key properties
     @NotBlank
     private String keyPrefix;

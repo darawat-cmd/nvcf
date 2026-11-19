@@ -20,24 +20,40 @@ package com.nvidia.apikeys.config;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.datastax.oss.driver.api.core.DefaultConsistencyLevel;
+import com.nvidia.apikeys.migration.KeysByAccountIndexMigrationScheduler;
 import jakarta.validation.Validation;
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.Map;
+import net.javacrumbs.shedlock.core.LockProvider;
 import org.junit.jupiter.api.Test;
+import org.springframework.boot.autoconfigure.AutoConfigurations;
+import org.springframework.boot.autoconfigure.context.ConfigurationPropertiesAutoConfiguration;
 import org.springframework.boot.context.properties.bind.Bindable;
 import org.springframework.boot.context.properties.bind.Binder;
+import org.springframework.boot.context.properties.bind.UnboundConfigurationPropertiesException;
+import org.springframework.boot.context.properties.bind.validation.BindValidationException;
 import org.springframework.boot.context.properties.source.MapConfigurationPropertySource;
+import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.cloud.autoconfigure.RefreshAutoConfiguration;
+import org.springframework.cloud.context.scope.refresh.RefreshScope;
+import org.springframework.core.env.MapPropertySource;
 
 class KeysByAccountIndexMigrationPropertiesTest {
+    private final ApplicationContextRunner contextRunner = new ApplicationContextRunner()
+            .withConfiguration(AutoConfigurations.of(ConfigurationPropertiesAutoConfiguration.class,
+                    RefreshAutoConfiguration.class))
+            .withUserConfiguration(KeysByAccountIndexMigrationProperties.class);
+
     @Test
     void bindsOperatorSettingsAndKeepsSafeDefaults() {
         var binder = new Binder(new MapConfigurationPropertySource(Map.of(
-                "apikeys.migration.keys-by-account-index.page-size", "17",
-                "apikeys.migration.keys-by-account-index.fixed-delay", "2m",
-                "apikeys.migration.keys-by-account-index.lock-consistency", "QUORUM",
-                "apikeys.migration.keys-by-account-index.lock-serial-consistency", "SERIAL")));
-        var properties = binder.bind("apikeys", Bindable.of(NakProperties.class)).orElseThrow(IllegalStateException::new);
-        var config = properties.getMigration().getKeysByAccountIndex();
+                "account-index-migration.page-size", "17",
+                "account-index-migration.fixed-delay", "2m",
+                "account-index-migration.lock-consistency", "QUORUM",
+                "account-index-migration.lock-serial-consistency", "SERIAL")));
+        var config = binder.bind("account-index-migration", Bindable.of(KeysByAccountIndexMigrationProperties.class))
+                .orElseThrow(IllegalStateException::new);
         assertThat(config.getPageSize()).isEqualTo(17);
         assertThat(config.getFixedDelay()).isEqualTo(Duration.ofMinutes(2));
         assertThat(config.getLockConsistency()).isEqualTo(DefaultConsistencyLevel.QUORUM);
@@ -68,6 +84,72 @@ class KeysByAccountIndexMigrationPropertiesTest {
             config.setLockSerialConsistency(DefaultConsistencyLevel.ONE);
             assertThat(validator.validate(config)).isNotEmpty();
         }
+    }
+
+    @Test
+    void standaloneSettingsRefreshThroughInjectedBean() {
+        var values = new HashMap<String, Object>();
+        values.put("account-index-migration.page-size", "17");
+        contextRunner.withInitializer(context -> context.getEnvironment().getPropertySources()
+                .addFirst(new MapPropertySource("migration-test", values))).run(context -> {
+                    assertThat(context).hasNotFailed();
+                    var config = context.getBean(KeysByAccountIndexMigrationProperties.class);
+                    assertThat(config.getPageSize()).isEqualTo(17);
+
+                    values.put("account-index-migration.page-size", "23");
+                    context.getBean(RefreshScope.class).refreshAll();
+
+                    assertThat(config.getPageSize()).isEqualTo(23);
+                });
+    }
+
+    @Test
+    void invalidBoundSettingsFailStartup() {
+        contextRunner.withPropertyValues("account-index-migration.page-size=0").run(context -> {
+            assertThat(context).hasFailed();
+            assertThat(context.getStartupFailure()).hasRootCauseInstanceOf(BindValidationException.class);
+        });
+    }
+
+    @Test
+    void unknownMigrationSettingsFailStartup() {
+        contextRunner.withPropertyValues("account-index-migration.page-szie=17").run(context -> {
+            assertThat(context).hasFailed();
+            assertThat(context.getStartupFailure()).hasRootCauseInstanceOf(UnboundConfigurationPropertiesException.class);
+        });
+    }
+
+    @Test
+    void disabledMigrationDoesNotCreateSchedulerOrLockProvider() {
+        contextRunner.withUserConfiguration(AccountIndexMigrationConfiguration.class,
+                        KeysByAccountIndexMigrationScheduler.class)
+                .withPropertyValues("account-index-migration.enabled=false").run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context.getBean(KeysByAccountIndexMigrationProperties.class).isEnabled()).isFalse();
+                    assertThat(context).doesNotHaveBean(KeysByAccountIndexMigrationScheduler.class)
+                            .doesNotHaveBean(LockProvider.class);
+                });
+    }
+
+    @Test
+    void standaloneMigrationSettingsCoexistWithStrictServiceSettings() {
+        serviceContext().withPropertyValues("account-index-migration.page-size=17").run(context -> {
+            assertThat(context).hasNotFailed();
+            assertThat(context.getBean(NakProperties.class).getNcaId()).isEqualTo("test-account");
+            assertThat(context.getBean(KeysByAccountIndexMigrationProperties.class).getPageSize()).isEqualTo(17);
+        });
+        serviceContext().withPropertyValues("apikeys.unknown-setting=unexpected").run(context -> {
+            assertThat(context).hasFailed();
+            assertThat(context.getStartupFailure()).hasRootCauseInstanceOf(UnboundConfigurationPropertiesException.class);
+        });
+    }
+
+    private ApplicationContextRunner serviceContext() {
+        return contextRunner.withUserConfiguration(NakProperties.class).withPropertyValues(
+                "apikeys.nca-id=test-account", "apikeys.registrations=[]", "apikeys.service-id-map.nvcf=cloud-functions",
+                "apikeys.key-prefix=test-", "apikeys.data-domain-key=test", "apikeys.keep-after-expired-duration=P2D",
+                "apikeys.jwks.private-jwks=test", "apikeys.jwks.jwe-key-mapping.payload_jwe_kid=test",
+                "apikeys.encrypted-model-converter.base-package=com.nvidia.apikeys");
     }
 
     private void assertValid(KeysByAccountIndexMigrationProperties config) {

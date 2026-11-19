@@ -17,7 +17,7 @@
 
 package com.nvidia.apikeys.migration;
 
-import com.nvidia.apikeys.config.NakProperties;
+import com.nvidia.apikeys.config.KeysByAccountIndexMigrationProperties;
 import java.time.Duration;
 import java.util.function.LongSupplier;
 import lombok.RequiredArgsConstructor;
@@ -30,22 +30,21 @@ import org.springframework.stereotype.Service;
 
 @Service
 @RequiredArgsConstructor
-@ConditionalOnProperty(prefix = "apikeys.migration.keys-by-account-index",
+@ConditionalOnProperty(prefix = "account-index-migration",
         name = "enabled", havingValue = "true", matchIfMissing = true)
 public class KeysByAccountIndexMigrationScheduler {
     private final KeysByAccountIndexMigrationTask task;
-    private final NakProperties properties;
+    private final KeysByAccountIndexMigrationProperties properties;
 
-    @Scheduled(initialDelayString = "${apikeys.migration.keys-by-account-index.initial-delay:PT30M}",
-            fixedDelayString = "${apikeys.migration.keys-by-account-index.fixed-delay:PT5M}")
+    @Scheduled(initialDelayString = "${account-index-migration.initial-delay:PT30M}",
+            fixedDelayString = "${account-index-migration.fixed-delay:PT5M}")
     @SchedulerLock(name = "keys-by-account-index-copy",
-            lockAtLeastFor = "${apikeys.migration.keys-by-account-index.lock-at-least-for:PT1S}",
-            lockAtMostFor = "${apikeys.migration.keys-by-account-index.lock-at-most-for:PT5M}")
+            lockAtLeastFor = "${account-index-migration.lock-at-least-for:PT1S}",
+            lockAtMostFor = "${account-index-migration.lock-at-most-for:PT5M}")
     public void run() {
         LockAssert.assertLocked();
-        var config = properties.getMigration().getKeysByAccountIndex();
-        var atMost = config.getLockAtMostFor();
-        var atLeast = config.getLockAtLeastFor();
+        var atMost = properties.getLockAtMostFor();
+        var atLeast = properties.getLockAtLeastFor();
         task.run(new LockRenewal(() -> LockExtender.extendActiveLock(atMost, atLeast),
                 atMost.dividedBy(3), System::nanoTime));
     }

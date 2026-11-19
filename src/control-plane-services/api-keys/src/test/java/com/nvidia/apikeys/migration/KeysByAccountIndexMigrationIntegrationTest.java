@@ -33,8 +33,8 @@ import com.nvidia.apikeys.config.IntegrationTestConfiguration;
 import com.nvidia.apikeys.config.KeysByAccountIndexMigrationProperties;
 import com.nvidia.apikeys.config.NakProperties;
 import com.nvidia.apikeys.facade.AdminFacade;
-import com.nvidia.apikeys.persistance.dao.KeysByAccountIndexMigrationDao;
 import com.nvidia.apikeys.persistance.dao.KeysByAccountIndexMigrationDao.TimedRow;
+import com.nvidia.apikeys.persistance.dao.KeysByAccountIndexMigrationDao;
 import com.nvidia.apikeys.persistance.dao.RowUpdateLockDao;
 import com.nvidia.apikeys.persistance.models.KeyByOwnerAndAccountAndServiceModel;
 import com.nvidia.apikeys.persistance.models.KeyByOwnerAndServiceModel;
@@ -64,6 +64,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.resttestclient.autoconfigure.AutoConfigureTestRestTemplate;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -89,6 +90,8 @@ class KeysByAccountIndexMigrationIntegrationTest {
     @Autowired
     private NakProperties properties;
     @Autowired
+    private KeysByAccountIndexMigrationProperties migrationProperties;
+    @Autowired
     private ServicesService services;
     @Autowired
     private OpenTelemetry telemetry;
@@ -113,17 +116,18 @@ class KeysByAccountIndexMigrationIntegrationTest {
 
     @BeforeEach
     void configure() {
-        savedConfig = properties.getMigration().getKeysByAccountIndex();
+        savedConfig = new KeysByAccountIndexMigrationProperties();
+        BeanUtils.copyProperties(migrationProperties, savedConfig);
         savedNcaId = properties.getNcaId();
-        properties.getMigration().setKeysByAccountIndex(KeysByAccountIndexMigrationProperties.builder()
-                .pageSize(1).batchDelay(Duration.ZERO).settleDelay(Duration.ofMillis(1)).build());
+        BeanUtils.copyProperties(KeysByAccountIndexMigrationProperties.builder()
+                .pageSize(1).batchDelay(Duration.ZERO).settleDelay(Duration.ofMillis(1)).build(), migrationProperties);
         timestamp = Instant.now().minusSeconds(600).toEpochMilli() * 1000;
         registry = new SimpleMeterRegistry();
     }
 
     @AfterEach
     void restore() {
-        properties.getMigration().setKeysByAccountIndex(savedConfig);
+        BeanUtils.copyProperties(savedConfig, migrationProperties);
         properties.setNcaId(savedNcaId);
         registry.close();
     }
@@ -620,7 +624,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
 
     @Test
     void renewsCassandraLockWithinSlowPageAndKeepsContenderOut() {
-        properties.getMigration().getKeysByAccountIndex().setPageSize(10);
+        migrationProperties.setPageSize(10);
         for (var i = 0; i < 3; i++) {
             seed(source().toBuilder().keyId("slow-key-" + i).keyHash("slow-hash-" + i).build(), false);
         }
@@ -681,7 +685,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
     }
 
     private KeysByAccountIndexMigrationTask task(KeysByAccountIndexMigrationDao migrationDao) {
-        var task = new KeysByAccountIndexMigrationTask(migrationDao, markers, properties, services,
+        var task = new KeysByAccountIndexMigrationTask(migrationDao, markers, properties, migrationProperties, services,
                 ownerConverter, accountConverter, registry, telemetry, Clock.systemUTC());
         task.initializeMetrics();
         return task;

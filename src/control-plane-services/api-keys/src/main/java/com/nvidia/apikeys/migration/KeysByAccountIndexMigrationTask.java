@@ -70,6 +70,7 @@ public class KeysByAccountIndexMigrationTask {
     private final KeysByAccountIndexMigrationDao dao;
     private final RowUpdateLockDao markers;
     private final NakProperties properties;
+    private final KeysByAccountIndexMigrationProperties migrationProperties;
     private final ServicesService services;
     private final EncryptedModelConverter<KeyByOwnerAndServiceModel, KeyByOwnerAndServiceVo> ownerConverter;
     private final EncryptedModelConverter<KeyByOwnerAndAccountAndServiceModel,
@@ -88,7 +89,7 @@ public class KeysByAccountIndexMigrationTask {
     }
 
     public void run(Runnable renewLock) {
-        var config = config();
+        var config = migrationProperties;
         if (!config.isEnabled()) {
             return;
         }
@@ -128,8 +129,8 @@ public class KeysByAccountIndexMigrationTask {
     }
 
     private void scan(Summary summary, Runnable renewLock) throws InterruptedException {
-        pages(state -> dao.accountPage(state, config().getPageSize()), row -> reconcileAccount(row, summary), renewLock);
-        pages(state -> dao.ownerPage(state, config().getPageSize()), row -> copy(row, summary), renewLock);
+        pages(state -> dao.accountPage(state, migrationProperties.getPageSize()), row -> reconcileAccount(row, summary), renewLock);
+        pages(state -> dao.ownerPage(state, migrationProperties.getPageSize()), row -> copy(row, summary), renewLock);
     }
 
     private void copy(TimedRow<KeyByOwnerAndServiceModel> source, Summary summary) {
@@ -264,7 +265,7 @@ public class KeysByAccountIndexMigrationTask {
                 recoverAssignment(source.get(), key, summary);
                 return;
             }
-            var oldestAllowed = clock.instant().minus(config().getOrphanMinAge()).toEpochMilli() * 1000;
+            var oldestAllowed = clock.instant().minus(migrationProperties.getOrphanMinAge()).toEpochMilli() * 1000;
             if (row.timestamp() > oldestAllowed || dao.ownerExists(key, issuers)) {
                 record(summary, "retry", true);
                 return;
@@ -296,13 +297,13 @@ public class KeysByAccountIndexMigrationTask {
             }
             renewLock.run();
             cursor = page.nextPage();
-            pause(config().getBatchDelay(), renewLock);
+            pause(migrationProperties.getBatchDelay(), renewLock);
         } while (cursor != null);
     }
 
     private <T> Page<T> fetch(Supplier<Page<T>> fetch, Runnable renewLock) {
         RuntimeException failure = null;
-        for (var attempt = 0; attempt < config().getPageFetchAttempts(); attempt++) {
+        for (var attempt = 0; attempt < migrationProperties.getPageFetchAttempts(); attempt++) {
             renewLock.run();
             try {
                 return fetch.get();
@@ -315,7 +316,7 @@ public class KeysByAccountIndexMigrationTask {
 
     private void pause(Duration delay, Runnable renewLock) throws InterruptedException {
         var remaining = delay.toMillis();
-        var chunk = Math.max(1, Math.min(30_000, config().getLockAtMostFor().toMillis() / 3));
+        var chunk = Math.max(1, Math.min(30_000, migrationProperties.getLockAtMostFor().toMillis() / 3));
         while (remaining > 0) {
             renewLock.run();
             var step = Math.min(remaining, chunk);
@@ -328,10 +329,6 @@ public class KeysByAccountIndexMigrationTask {
         registry.counter(KEYS_METRIC, "result", result).increment();
         summary.counts.merge(result, 1L, Long::sum);
         summary.clean &= !dirty;
-    }
-
-    private KeysByAccountIndexMigrationProperties config() {
-        return properties.getMigration().getKeysByAccountIndex();
     }
 
     private static class Summary {
