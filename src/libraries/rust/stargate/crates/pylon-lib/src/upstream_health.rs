@@ -71,6 +71,8 @@ impl ReadinessGate {
         url.set_port(port).map_err(|()| {
             ReadinessGateError::PortNotSupported(upstream_http_base_url.to_string())
         })?;
+        // Replaces any path prefix: the declared check is host, port, and path,
+        // as the `utils` worker probes it.
         url.set_path(&path);
         Ok(Self {
             url: url.into(),

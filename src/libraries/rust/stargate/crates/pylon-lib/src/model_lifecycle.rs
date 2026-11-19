@@ -58,8 +58,9 @@ pub struct ModelLifecycleConfig {
     pub initialization: ModelInitialization,
     pub bringup: BringupConfig,
     pub health_paths: UpstreamHealthPaths,
-    /// When set, startup and each model's initialization wait for this strict
-    /// check instead of `health_paths`, even with bringup off.
+    /// When set, every upstream probe at startup and in model initialization uses
+    /// this strict check instead of `health_paths`; startup waits for it even
+    /// with bringup off.
     pub readiness_gate: Option<ReadinessGate>,
     /// How long startup retries the upstream health probe before failing. Zero
     /// probes once and leaves recovery to the container restart.
@@ -695,7 +696,7 @@ fn health_probe_timeout(config: &ModelLifecycleConfig) -> Option<Duration> {
     match &config.initialization {
         ModelInitialization::Calibration(calibration) => Some(calibration.health_timeout),
         ModelInitialization::ConfiguredInputTps { .. } | ModelInitialization::Uncalibrated
-            if config.bringup.enabled || config.readiness_gate.is_some() =>
+            if config.bringup.enabled =>
         {
             Some(config.bringup.canary_timeout)
         }
@@ -707,7 +708,14 @@ async fn wait_for_upstream_health(
     http_client: &reqwest::Client,
     config: &ModelLifecycleConfig,
 ) -> Result<(), ModelLifecycleError> {
-    let Some(health_timeout) = health_probe_timeout(config) else {
+    // The gate holds startup even where no per-model probe runs, so a model is
+    // never admitted on a check the gate has not passed.
+    let Some(health_timeout) = health_probe_timeout(config).or_else(|| {
+        config
+            .readiness_gate
+            .as_ref()
+            .map(|_| config.bringup.canary_timeout)
+    }) else {
         return Ok(());
     };
     let deadline = Instant::now() + config.startup_health_wait;
