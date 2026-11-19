@@ -27,10 +27,11 @@ use pylon_lib::{
     InferenceServerRegistrationConfig, MetricsServerHandle, ModelDiscoveryConfig,
     ModelInitialization, ModelLifecycleConfig, ModelLifecycleHandle, ModelSource, PylonMetrics,
     PylonQueueMismatchRetryConfig, PylonRetryConfig, PylonRuntimeState, QuicHttpTunnelConfig,
-    QuicHttpTunnelHandle, RequestQualityMonitorConfig, StatsCollectorConfig, StatsCollectorHandle,
-    TunnelForwardingConfig, UpstreamBackend, UpstreamHealthPaths, start_engine_stats_stream,
-    start_metrics_server, start_model_lifecycle, start_quic_http_tunnel,
-    start_stats_collector_with_engine_stats, stats_aggregator_update_channel,
+    QuicHttpTunnelHandle, ReadinessGate, RequestQualityMonitorConfig, StartupReadiness,
+    StatsCollectorConfig, StatsCollectorHandle, TunnelForwardingConfig, UpstreamBackend,
+    UpstreamHealthPaths, start_engine_stats_stream, start_metrics_server, start_model_lifecycle,
+    start_quic_http_tunnel, start_stats_collector_with_engine_stats,
+    stats_aggregator_update_channel,
 };
 use stargate_proto::pb::InferenceServerStatus;
 use stargate_protocol::BackendConnectivity;
@@ -46,6 +47,7 @@ const DEFAULT_STARTUP_HEALTH_WAIT: Duration = Duration::from_secs(60);
 const DEFAULT_CALIBRATION_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_FALLBACK_CALIBRATION_TIMEOUT_MS: u64 = 5_000;
 const INFERENCE_READY_TIMEOUT_ENV: &str = "INFERENCE_READY_TIMEOUT";
+const DEFAULT_READINESS_HEALTH_STATUS: u16 = 200;
 
 pub(super) async fn run(args: Args) -> Result<()> {
     let plan = PylonStartupPlan::from_args(&args)?;
@@ -60,6 +62,12 @@ pub(super) async fn run(args: Args) -> Result<()> {
             value = %value,
             default = ?DEFAULT_STARTUP_HEALTH_WAIT,
             "ignoring invalid {INFERENCE_READY_TIMEOUT_ENV}; using the default upstream health wait"
+        );
+    }
+    if let Some(protocol) = &plan.unchecked_readiness_protocol {
+        warn!(
+            protocol = %protocol,
+            "--readiness-gate checks only HTTP health checks; using the upstream health paths"
         );
     }
     let signal = wait_for_termination_signal();
@@ -147,6 +155,8 @@ pub(crate) struct PylonStartupPlan {
     force_chat_completions_include_usage: bool,
     output_token_calibration: OutputTokenCalibrationMode,
     health_paths: UpstreamHealthPaths,
+    readiness_gate: Option<ReadinessGate>,
+    unchecked_readiness_protocol: Option<String>,
     startup_health_wait: Duration,
     ignored_inference_ready_timeout: Option<String>,
     metrics_addr: SocketAddr,
@@ -196,6 +206,7 @@ impl PylonStartupPlan {
         let model_source = model_source_from_args(args)?;
         let (startup_health_wait, ignored_inference_ready_timeout) =
             resolve_startup_health_wait(args.upstream_health_wait_ms, inference_ready_timeout);
+        let (readiness_gate, unchecked_readiness_protocol) = readiness_gate_from_args(args)?;
         Ok(Self {
             upstream: normalize_base_url(&args.upstream_http_base_url),
             cluster_id: effective_cluster_id(args),
@@ -217,6 +228,8 @@ impl PylonStartupPlan {
             force_chat_completions_include_usage: args.force_chat_completions_include_usage,
             output_token_calibration: args.output_token_calibration,
             health_paths: UpstreamHealthPaths::new(args.upstream_health_paths.clone()),
+            readiness_gate,
+            unchecked_readiness_protocol,
             startup_health_wait,
             ignored_inference_ready_timeout,
             metrics_addr: format!("{}:{}", args.metrics_host, args.metrics_port).parse()?,
@@ -237,6 +250,50 @@ impl PylonStartupPlan {
             ModelSource::Discovered(_) => None,
         }
     }
+}
+
+/// Returns the gate, or the declared protocol when it is not HTTP and the gate
+/// stays off. Values are only parsed when the gate is on, so a malformed
+/// health setting cannot stop a Pylon that does not use it.
+fn readiness_gate_from_args(args: &Args) -> Result<(Option<ReadinessGate>, Option<String>)> {
+    if !args.readiness_gate {
+        return Ok((None, None));
+    }
+    let protocol = non_empty(&args.readiness_health_protocol).unwrap_or("http");
+    if !protocol.eq_ignore_ascii_case("http") {
+        return Ok((None, Some(protocol.to_string())));
+    }
+    let path = non_empty(&args.readiness_health_path)
+        .context("--readiness-gate needs --readiness-health-path or INFERENCE_HEALTH_ENDPOINT")?;
+    let port = non_empty(&args.readiness_health_port)
+        .map(|port| {
+            port.parse::<u16>()
+                .with_context(|| format!("invalid readiness health port {port:?}"))
+        })
+        .transpose()?
+        .filter(|port| *port != 0);
+    let expected_status = non_empty(&args.readiness_health_expected_status)
+        .map(|status| {
+            status
+                .parse::<u16>()
+                .with_context(|| format!("invalid readiness health status {status:?}"))
+        })
+        .transpose()?
+        .unwrap_or(DEFAULT_READINESS_HEALTH_STATUS);
+    let gate = ReadinessGate::new(
+        &normalize_base_url(&args.upstream_http_base_url),
+        path,
+        port,
+        expected_status,
+    )?;
+    Ok((Some(gate), None))
+}
+
+fn non_empty(value: &Option<String>) -> Option<&str> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn resolve_startup_health_wait(
@@ -516,7 +573,9 @@ async fn start_pylon_runtime(args: &Args, plan: &PylonStartupPlan) -> Result<Run
             .or(option_env!("GIT_COMMIT_SHA"))
             .unwrap_or(""),
     );
-    let metrics_server = start_metrics_server(plan.metrics_addr, metrics.registry()).await?;
+    let readiness = StartupReadiness::default();
+    let metrics_server =
+        start_metrics_server(plan.metrics_addr, metrics.registry(), readiness.clone()).await?;
     let stats_config = stats_collector_config_from_args(args, &plan.upstream);
     let (runtime_state, request_observation_rx) = PylonRuntimeState::observed(
         InferenceServerStatus::Active,
@@ -611,6 +670,7 @@ async fn start_pylon_runtime(args: &Args, plan: &PylonStartupPlan) -> Result<Run
             initialization: plan.model_initialization.clone(),
             bringup: plan.bringup.clone(),
             health_paths: plan.health_paths.clone(),
+            readiness_gate: plan.readiness_gate.clone(),
             startup_health_wait: plan.startup_health_wait,
         },
         runtime_state.clone(),
@@ -631,6 +691,7 @@ async fn start_pylon_runtime(args: &Args, plan: &PylonStartupPlan) -> Result<Run
     );
     let mut registration_client = InferenceServerRegistrationClient::default();
     registration_client.start(registration_config)?;
+    readiness.mark_ready();
 
     Ok(RunningPylon {
         inference_server_id: args.inference_server_id.clone(),
@@ -969,6 +1030,114 @@ mod tests {
         let plan = PylonStartupPlan::from_args_and_inference_ready_timeout(&args, None)
             .expect("startup plan should build");
         (args, plan)
+    }
+
+    #[test]
+    fn readiness_gate_targets_the_declared_check_only_when_switched_on() {
+        for (label, extra, expected_url, unchecked_protocol) in [
+            (
+                "off, malformed settings ignored",
+                &[
+                    "--readiness-health-port",
+                    "x",
+                    "--readiness-health-path",
+                    "/ready",
+                ][..],
+                None,
+                None,
+            ),
+            (
+                "sidecar port",
+                &[
+                    "--readiness-gate",
+                    "--readiness-health-path",
+                    "/ready",
+                    "--readiness-health-port",
+                    "8001",
+                    "--readiness-health-protocol",
+                    "HTTP",
+                ][..],
+                Some("http://127.0.0.1:8001/ready"),
+                None,
+            ),
+            (
+                "port 0 uses the upstream port",
+                &[
+                    "--readiness-gate",
+                    "--readiness-health-path",
+                    "/v2/health/ready",
+                    "--readiness-health-port",
+                    "0",
+                ][..],
+                Some("http://127.0.0.1:8090/v2/health/ready"),
+                None,
+            ),
+            (
+                "gRPC keeps the upstream health paths",
+                &[
+                    "--readiness-gate",
+                    "--readiness-health-path",
+                    "/grpc.health.v1.Health/Check",
+                    "--readiness-health-protocol",
+                    "GRPC",
+                ][..],
+                None,
+                Some("GRPC"),
+            ),
+        ] {
+            let (_, plan) = startup(extra);
+
+            assert_eq!(
+                plan.readiness_gate.as_ref().map(ReadinessGate::url),
+                expected_url,
+                "{label}"
+            );
+            assert_eq!(
+                plan.unchecked_readiness_protocol.as_deref(),
+                unchecked_protocol,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn readiness_gate_rejects_missing_or_malformed_settings_when_switched_on() {
+        for (label, extra) in [
+            ("no path", &["--readiness-gate"][..]),
+            (
+                "bad port",
+                &[
+                    "--readiness-gate",
+                    "--readiness-health-path",
+                    "/ready",
+                    "--readiness-health-port",
+                    "x",
+                ][..],
+            ),
+            (
+                "bad status",
+                &[
+                    "--readiness-gate",
+                    "--readiness-health-path",
+                    "/ready",
+                    "--readiness-health-expected-status",
+                    "1000",
+                ][..],
+            ),
+        ] {
+            let mut argv = vec![
+                "pylon",
+                "--upstream-http-base-url",
+                "http://127.0.0.1:8090/",
+            ];
+            argv.extend_from_slice(extra);
+            let args = <Args as Parser>::try_parse_from(argv).expect(label);
+
+            assert!(
+                PylonStartupPlan::from_args_and_inference_ready_timeout(&args, None).is_err(),
+                "{label}"
+            );
+        }
     }
 
     #[test]
@@ -1366,6 +1535,7 @@ mod tests {
                     ..BringupConfig::default()
                 },
                 health_paths: UpstreamHealthPaths::default(),
+                readiness_gate: None,
                 startup_health_wait: Duration::ZERO,
             },
             PylonRuntimeState::default(),
@@ -1383,6 +1553,7 @@ mod tests {
             metrics_server: start_metrics_server(
                 "127.0.0.1:0".parse().expect("metrics address should parse"),
                 metrics.registry(),
+                StartupReadiness::default(),
             )
             .await
             .expect("metrics server should start"),
@@ -2051,6 +2222,7 @@ mod tests {
                     ..BringupConfig::default()
                 },
                 health_paths: UpstreamHealthPaths::default(),
+                readiness_gate: None,
                 startup_health_wait: Duration::ZERO,
             },
             runtime_state.clone(),

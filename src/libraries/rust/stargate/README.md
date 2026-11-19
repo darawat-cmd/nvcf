@@ -47,6 +47,17 @@ retries the probe (`0` probes once and exits). Without the flag, Pylon uses the
 Go duration in `INFERENCE_READY_TIMEOUT` (for example `2h0m0s`) when it is set
 to a positive Go duration, and 60000 otherwise.
 
+`--readiness-gate` (`PYLON_READINESS_GATE`) replaces that startup probe with the
+function's declared HTTP health check: the path, port, and expected status in
+`INFERENCE_HEALTH_ENDPOINT`, `INFERENCE_HEALTH_PORT`, and
+`INFERENCE_HEALTH_EXPECTED_RESPONSE_CODE`, on the upstream host. Only the
+expected status passes, and the gate applies with or without bringup canaries.
+When the declared check is the NVCF default, `/v2/health/ready` on the upstream
+port, and the upstream answers it with 404, Pylon logs a warning and uses the
+upstream health paths. A gRPC health check keeps the upstream health paths. The
+metrics listener serves `GET /ready`: 503 until startup admission ends and
+registration starts, then 200 for the life of the process.
+
 For engines without a stats endpoint, set `pylon --max-engine-concurrency N`
 to provide a positive concurrency fallback for routing and local queue
 admission. Engine-reported limits take precedence. See the

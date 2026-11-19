@@ -23,7 +23,7 @@ use crate::request_observer::{
 };
 use crate::runtime_state::{ModelGeneration, PylonRuntimeState};
 use crate::sse_message_stream::{RelayOutcome, UpstreamSseReadError, upstream_sse_message_stream};
-use crate::upstream_health::UpstreamHealthPaths;
+use crate::upstream_health::{ReadinessGate, UpstreamHealthPaths};
 use crate::upstream_url::upstream_endpoint;
 use futures::StreamExt;
 use reqwest::StatusCode;
@@ -50,6 +50,25 @@ pub(crate) async fn check_upstream_health(
         }
     }
     false
+}
+
+pub(crate) async fn check_readiness_gate(
+    http_client: &reqwest::Client,
+    upstream_http_base_url: &str,
+    timeout: Duration,
+    gate: &ReadinessGate,
+    fallback_paths: &UpstreamHealthPaths,
+) -> bool {
+    let status = match http_client.get(gate.url()).timeout(timeout).send().await {
+        Ok(response) => response.status(),
+        Err(_) => return false,
+    };
+    if status == gate.expected_status() {
+        return true;
+    }
+    status == StatusCode::NOT_FOUND
+        && gate.not_found_falls_back()
+        && check_upstream_health(http_client, upstream_http_base_url, timeout, fallback_paths).await
 }
 
 async fn ensure_success(response: reqwest::Response) -> Result<reqwest::Response, BringupError> {

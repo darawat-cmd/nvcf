@@ -25,6 +25,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
 )
@@ -60,6 +61,12 @@ const (
 	defaultLLMInferenceStopPause = 60 * time.Second
 	llmWorkerShutdownAllowance   = 5 * time.Second
 	llmInferenceExitAllowance    = 60 * time.Second
+
+	// With this switch on, Pylon waits for the function's declared health
+	// check and serves the result on /ready. Operators turn it on per cluster
+	// through functionEnvOverrides; a Pylon without /ready never becomes Ready.
+	llmReadinessGateEnv = "PYLON_READINESS_GATE"
+	llmReadinessPath    = "/ready"
 )
 
 // llmShutdown is the shutdown timing of an LLM container function pod, all
@@ -148,6 +155,33 @@ func upstreamHealthPath(allEnvSet map[string]string) string {
 		return ""
 	}
 	return path
+}
+
+// llmWorkerReadinessProbe gates the llm-worker container, and so the function
+// status, on Pylon's /ready. Pylon has no gRPC prober, so a gRPC health check
+// gets no probe.
+func llmWorkerReadinessProbe(allEnvSet map[string]string) *corev1.Probe {
+	isGateOn, err := strconv.ParseBool(strings.TrimSpace(allEnvSet[llmReadinessGateEnv]))
+	if err != nil || !isGateOn {
+		return nil
+	}
+	if strings.EqualFold(strings.TrimSpace(allEnvSet["INFERENCE_HEALTH_PROTOCOL"]), "grpc") {
+		return nil
+	}
+	// Same timings as the utils container probe.
+	return &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			HTTPGet: &corev1.HTTPGetAction{
+				Path: llmReadinessPath,
+				Port: intstr.FromString(common.WorkerMetricsPortName),
+			},
+		},
+		InitialDelaySeconds: 0,
+		PeriodSeconds:       10,
+		FailureThreshold:    2,
+		SuccessThreshold:    1,
+		TimeoutSeconds:      6,
+	}
 }
 
 // newLLMRouterClientContainer builds the Pylon sidecar for an LLM worker.
@@ -258,8 +292,9 @@ func newLLMRouterClientContainer(
 			ContainerPort: llmMetricsPort,
 			Protocol:      corev1.ProtocolTCP,
 		}},
-		Args: args,
-		Env:  common.SortEnvs(envs),
+		Args:           args,
+		Env:            common.SortEnvs(envs),
+		ReadinessProbe: llmWorkerReadinessProbe(allEnvSet),
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
 				corev1.ResourceCPU:    *resource.NewMilliQuantity(500, resource.DecimalSI),
@@ -270,7 +305,6 @@ func newLLMRouterClientContainer(
 				corev1.ResourceMemory: *resource.NewQuantity(1024*1<<20, resource.BinarySI),
 			},
 		},
-		// TODO: add probes once /health and /ready are implemented
 		VolumeMounts: []corev1.VolumeMount{
 			{
 				Name:      "llm",

@@ -70,9 +70,10 @@ per second. To start it at a measured rate instead, set
 `nvca-operator` chart values. `pylon` then measures each model's input rate
 before it registers. Older `pylon` versions ignore this variable and start at
 100. A model whose calibration fails starts at 100 and logs a warning.
-Calibration adds about 5 to 15 seconds per model name to worker startup. The
-worker pod can be Ready during that time. If the function has no other
-registered worker, a request then gets `404` with `no_eligible_candidates`.
+Calibration adds about 5 to 15 seconds per model name to worker startup. Unless
+`PYLON_READINESS_GATE` is on, the worker pod can be Ready during that time. If
+the function has no other registered worker, a request then gets `404` with
+`no_eligible_candidates`.
 
 To change the time limit for each calibration load step, 5 seconds by default,
 set `PYLON_BRINGUP_CALIBRATION_TIMEOUT_MS` there. `PYLON_DO_CALIBRATION` must
@@ -80,6 +81,28 @@ be `true` or `false`, and `PYLON_BRINGUP_CALIBRATION_TIMEOUT_MS` must be a
 positive number of milliseconds. The overrides apply to every LLM function on
 the cluster, so an invalid value stops `pylon` on every new LLM worker there.
 Both variables apply to worker pods created after NVCA picks up the new values.
+
+By default an LLM worker pod is Ready as soon as `pylon` starts, so a new
+function version can become `ACTIVE` before its model workers load. To hold
+readiness until the function's health check passes, set
+`PYLON_READINESS_GATE: "true"` in `agent.functionEnvOverrides`. `pylon` then
+waits for the health check declared on the function, with its path, port, and
+expected status, before it calibrates and registers. NVCA adds a readiness probe
+on `pylon`'s `/ready`, so the worker is Ready, and the version `ACTIVE`, only
+after that check passes and `pylon` has registered. The worker still has
+`INFERENCE_READY_TIMEOUT` to pass, as other functions do.
+
+- Declare a health check that waits for the model workers, for example a
+  sidecar that answers `200` only when enough workers are ready. A function with
+  no health check gets the NVCF default `/v2/health/ready`. If the backend
+  answers that path with `404`, `pylon` logs a warning and keeps its usual
+  health paths, so readiness does not wait for the workers.
+- Functions with a gRPC health check keep the current behavior and get no
+  readiness probe.
+- Turn the switch on only when every LLM worker on the cluster runs a `pylon`
+  that serves `/ready`. An older `pylon` answers `404` there, so its workers
+  never become Ready and are removed when the startup timeout ends. Turn the
+  switch off before you roll `pylon` back to such a version.
 
 ## Enable on an Existing Installation
 

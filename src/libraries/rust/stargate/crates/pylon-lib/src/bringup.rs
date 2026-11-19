@@ -24,7 +24,7 @@ mod upstream;
 pub(crate) use calibration::run_calibration;
 pub(crate) use lifecycle::run_bringup_task;
 pub use upstream::BringupError;
-pub(crate) use upstream::check_upstream_health;
+pub(crate) use upstream::{check_readiness_gate, check_upstream_health};
 
 const DEFAULT_ACTIVE_CANARY_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_CANARY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -111,7 +111,7 @@ mod tests {
 
     use crate::runtime_state::PylonRuntimeState;
     use crate::test_support::TestHttpServer;
-    use crate::upstream_health::UpstreamHealthPaths;
+    use crate::upstream_health::{ReadinessGate, UpstreamHealthPaths};
     use crate::{StatsCollectorConfig, StatsCollectorHandle, start_stats_collector};
 
     async fn wait_for_bringup_ready(runtime_state: &PylonRuntimeState, expected: bool) {
@@ -337,6 +337,81 @@ mod tests {
         assert_eq!(health_requests.load(Ordering::SeqCst), 1);
         assert_eq!(ready_requests.load(Ordering::SeqCst), 2);
 
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn readiness_gate_passes_only_on_the_expected_status() {
+        // Every upstream also answers `/health`, which the lenient probe accepts.
+        for (label, path, served, expected, want) in [
+            ("declared check not ready", "/ready", 503, 200, false),
+            ("declared check ready", "/ready", 200, 200, true),
+            ("declared path not served", "/ready", 404, 200, false),
+            (
+                "2xx other than the expected status",
+                "/ready",
+                204,
+                200,
+                false,
+            ),
+            ("custom expected status", "/ready", 204, 204, true),
+            (
+                "default check not served",
+                "/v2/health/ready",
+                404,
+                200,
+                true,
+            ),
+            (
+                "default check not ready",
+                "/v2/health/ready",
+                503,
+                200,
+                false,
+            ),
+        ] {
+            let status = StatusCode::from_u16(served).expect(label);
+            let server = TestHttpServer::spawn(
+                Router::new()
+                    .route("/health", get(|| async { "ok" }))
+                    .route(path, get(move || async move { status })),
+            )
+            .await;
+            let gate = ReadinessGate::new(server.as_str(), path, None, expected).expect(label);
+
+            assert_eq!(
+                check_readiness_gate(
+                    &reqwest::Client::new(),
+                    server.as_str(),
+                    Duration::from_secs(1),
+                    &gate,
+                    &UpstreamHealthPaths::default(),
+                )
+                .await,
+                want,
+                "{label}"
+            );
+            server.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn readiness_gate_fails_when_the_declared_port_is_closed() {
+        let server =
+            TestHttpServer::spawn(Router::new().route("/health", get(|| async { "ok" }))).await;
+        let gate =
+            ReadinessGate::new(server.as_str(), "/ready", Some(1), 200).expect("gate should build");
+
+        assert!(
+            !check_readiness_gate(
+                &reqwest::Client::new(),
+                server.as_str(),
+                Duration::from_secs(1),
+                &gate,
+                &UpstreamHealthPaths::default(),
+            )
+            .await
+        );
         server.shutdown().await;
     }
 
