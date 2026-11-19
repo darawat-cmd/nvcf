@@ -27,6 +27,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -393,6 +394,26 @@ func TestResponseCompleteRecordsOnCloseWithoutReading(t *testing.T) {
 	require.Empty(t, histogramPoints(t, reader, completeMetricName))
 	require.NoError(t, resp.Body.Close())
 
+	points := histogramPoints(t, reader, completeMetricName)
+	require.Len(t, points, 1)
+	require.EqualValues(t, 1, points[0].Count)
+}
+
+func TestResponseCompleteIgnoresNonEOFReadErrorUntilClose(t *testing.T) {
+	reader := useTestMeterProvider(t)
+	transport := TracedRoundTripper(clientMetricTestTransport(func(*http.Request) (*http.Response, error) {
+		body := io.NopCloser(io.MultiReader(strings.NewReader("par"), iotest.ErrReader(io.ErrUnexpectedEOF)))
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: body}, nil
+	}))
+	resp, err := transport.RoundTrip(completeTestRequest(t))
+	require.NoError(t, err)
+	_, err = io.ReadAll(resp.Body)
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+
+	// A failed read is not a completed body, so nothing is recorded yet.
+	require.Empty(t, histogramPoints(t, reader, completeMetricName))
+
+	require.NoError(t, resp.Body.Close())
 	points := histogramPoints(t, reader, completeMetricName)
 	require.Len(t, points, 1)
 	require.EqualValues(t, 1, points[0].Count)

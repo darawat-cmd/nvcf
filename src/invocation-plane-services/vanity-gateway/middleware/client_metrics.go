@@ -135,8 +135,9 @@ func (rt clientMetricsRoundTripper) RoundTrip(r *http.Request) (*http.Response, 
 	return response, err
 }
 
-// completeTimingBody calls record once, on the first read error (including
-// io.EOF) or on Close, whichever comes first.
+// completeTimingBody calls record once, on io.EOF or on Close, whichever comes
+// first. Other read errors, such as io.ErrUnexpectedEOF, do not record so a
+// later Close still can.
 type completeTimingBody struct {
 	io.ReadCloser
 	once   sync.Once
@@ -145,7 +146,7 @@ type completeTimingBody struct {
 
 func (b *completeTimingBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
-	if err != nil {
+	if err == io.EOF {
 		b.once.Do(b.record)
 	}
 	return n, err
