@@ -364,7 +364,12 @@ func TestResponseCompleteRecordedAtEndOfBody(t *testing.T) {
 	require.Len(t, points, 1)
 	require.EqualValues(t, 1, points[0].Count)
 	require.GreaterOrEqual(t, points[0].Sum, bodyDelay.Seconds())
-	require.Equal(t, httpDurationHistogramBoundaries, points[0].Bounds)
+	require.Equal(t, responseCompleteHistogramBoundaries, points[0].Bounds)
+
+	// The existing client histogram keeps the shared buckets.
+	client := histogramPoints(t, reader, "http.client.request.duration")
+	require.Len(t, client, 1)
+	require.Equal(t, httpDurationHistogramBoundaries, client[0].Bounds)
 }
 
 func TestResponseCompleteRecordsOnceOnReadThenClose(t *testing.T) {

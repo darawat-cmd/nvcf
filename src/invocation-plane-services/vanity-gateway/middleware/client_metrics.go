@@ -73,6 +73,15 @@ func clientMetricContext(ctx context.Context) context.Context {
 	return otelhttp.ContextWithLabeler(ctx, labeler)
 }
 
+// responseCompleteHistogramBoundaries are the buckets of the response complete
+// histogram. They add finer edges (0.05, 1.5, 2.5 and 3 seconds) to the shared
+// HTTP duration buckets so SLO thresholds such as a 1.5s p99 can be expressed
+// without changing the existing HTTP duration histograms.
+var responseCompleteHistogramBoundaries = []float64{
+	0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 2.5,
+	3, 5, 10, 15, 30, 60, 120, 300, 600, 900,
+}
+
 // newResponseCompleteHistogram creates the histogram that measures the time
 // from sending the upstream request to the end of the response body. It
 // returns nil if the instrument cannot be created, which disables recording.
@@ -81,7 +90,7 @@ func newResponseCompleteHistogram(mp metric.MeterProvider) metric.Float64Histogr
 		responseCompleteMetricName,
 		metric.WithUnit("s"),
 		metric.WithDescription("Time from sending the upstream request to the end of the response body."),
-		metric.WithExplicitBucketBoundaries(httpDurationHistogramBoundaries...),
+		metric.WithExplicitBucketBoundaries(responseCompleteHistogramBoundaries...),
 	)
 	if err != nil {
 		otel.Handle(err)
