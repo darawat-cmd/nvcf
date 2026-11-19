@@ -18,9 +18,12 @@
 package com.nvidia.apikeys.config;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.mock;
 
+import com.datastax.oss.driver.api.core.CqlSession;
 import com.datastax.oss.driver.api.core.DefaultConsistencyLevel;
 import com.nvidia.apikeys.migration.KeysByAccountIndexMigrationScheduler;
+import com.nvidia.apikeys.migration.KeysByAccountIndexMigrationTask;
 import jakarta.validation.Validation;
 import java.time.Duration;
 import java.util.HashMap;
@@ -38,6 +41,7 @@ import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.cloud.autoconfigure.RefreshAutoConfiguration;
 import org.springframework.cloud.context.scope.refresh.RefreshScope;
 import org.springframework.core.env.MapPropertySource;
+import org.springframework.scheduling.config.ScheduledTaskHolder;
 
 class KeysByAccountIndexMigrationPropertiesTest {
     private final ApplicationContextRunner contextRunner = new ApplicationContextRunner()
@@ -120,14 +124,29 @@ class KeysByAccountIndexMigrationPropertiesTest {
     }
 
     @Test
-    void disabledMigrationDoesNotCreateSchedulerOrLockProvider() {
+    void disabledMigrationKeepsLockProviderAvailableWithoutCreatingScheduler() {
         contextRunner.withUserConfiguration(AccountIndexMigrationConfiguration.class,
                         KeysByAccountIndexMigrationScheduler.class)
+                .withBean(CqlSession.class, () -> mock(CqlSession.class))
                 .withPropertyValues("account-index-migration.enabled=false").run(context -> {
                     assertThat(context).hasNotFailed();
                     assertThat(context.getBean(KeysByAccountIndexMigrationProperties.class).isEnabled()).isFalse();
                     assertThat(context).doesNotHaveBean(KeysByAccountIndexMigrationScheduler.class)
-                            .doesNotHaveBean(LockProvider.class);
+                            .hasSingleBean(LockProvider.class);
+                });
+    }
+
+    @Test
+    void enabledMigrationRegistersScheduledJob() {
+        contextRunner.withUserConfiguration(AccountIndexMigrationConfiguration.class,
+                        KeysByAccountIndexMigrationScheduler.class)
+                .withBean(CqlSession.class, () -> mock(CqlSession.class))
+                .withBean(KeysByAccountIndexMigrationTask.class, () -> mock(KeysByAccountIndexMigrationTask.class))
+                .withPropertyValues("account-index-migration.enabled=true").run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context).hasSingleBean(KeysByAccountIndexMigrationScheduler.class)
+                            .hasSingleBean(LockProvider.class);
+                    assertThat(context.getBean(ScheduledTaskHolder.class).getScheduledTasks()).hasSize(1);
                 });
     }
 

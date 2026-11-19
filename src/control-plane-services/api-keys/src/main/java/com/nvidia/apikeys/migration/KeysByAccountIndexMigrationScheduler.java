@@ -25,10 +25,12 @@ import net.javacrumbs.shedlock.core.LockAssert;
 import net.javacrumbs.shedlock.core.LockExtender;
 import net.javacrumbs.shedlock.spring.annotation.SchedulerLock;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 @Service
+@EnableScheduling
 @RequiredArgsConstructor
 @ConditionalOnProperty(prefix = "account-index-migration",
         name = "enabled", havingValue = "true", matchIfMissing = true)
