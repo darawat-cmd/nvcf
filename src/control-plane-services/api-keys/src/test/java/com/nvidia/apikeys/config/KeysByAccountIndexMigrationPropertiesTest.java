@@ -22,8 +22,8 @@ import static org.mockito.Mockito.mock;
 
 import com.datastax.oss.driver.api.core.CqlSession;
 import com.datastax.oss.driver.api.core.DefaultConsistencyLevel;
-import com.nvidia.apikeys.migration.KeysByAccountIndexMigrationScheduler;
-import com.nvidia.apikeys.migration.KeysByAccountIndexMigrationTask;
+import com.nvidia.apikeys.scheduler.KeysByAccountIndexMigrationScheduler;
+import com.nvidia.apikeys.scheduler.KeysByAccountIndexMigrationTask;
 import jakarta.validation.Validation;
 import java.time.Duration;
 import java.util.HashMap;
@@ -125,7 +125,7 @@ class KeysByAccountIndexMigrationPropertiesTest {
 
     @Test
     void disabledMigrationKeepsLockProviderAvailableWithoutCreatingScheduler() {
-        contextRunner.withUserConfiguration(AccountIndexMigrationConfiguration.class,
+        contextRunner.withUserConfiguration(DistributedLockConfiguration.class,
                         KeysByAccountIndexMigrationScheduler.class)
                 .withBean(CqlSession.class, () -> mock(CqlSession.class))
                 .withPropertyValues("account-index-migration.enabled=false").run(context -> {
@@ -138,7 +138,7 @@ class KeysByAccountIndexMigrationPropertiesTest {
 
     @Test
     void enabledMigrationRegistersScheduledJob() {
-        contextRunner.withUserConfiguration(AccountIndexMigrationConfiguration.class,
+        contextRunner.withUserConfiguration(DistributedLockConfiguration.class,
                         KeysByAccountIndexMigrationScheduler.class)
                 .withBean(CqlSession.class, () -> mock(CqlSession.class))
                 .withBean(KeysByAccountIndexMigrationTask.class, () -> mock(KeysByAccountIndexMigrationTask.class))

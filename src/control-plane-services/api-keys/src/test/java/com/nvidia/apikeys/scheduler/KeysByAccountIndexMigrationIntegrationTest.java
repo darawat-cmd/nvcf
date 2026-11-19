@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-package com.nvidia.apikeys.migration;
+package com.nvidia.apikeys.scheduler;
 
 import static com.nvidia.apikeys.TestData.KEY_BY_OWNER_AND_SERVICE_VO_1;
 import static com.nvidia.apikeys.TestData.KEY_VO_1;

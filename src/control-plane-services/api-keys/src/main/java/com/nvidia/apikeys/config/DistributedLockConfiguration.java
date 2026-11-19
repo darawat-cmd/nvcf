@@ -26,7 +26,7 @@ import org.springframework.context.annotation.Configuration;
 
 @Configuration
 @EnableSchedulerLock(defaultLockAtMostFor = "PT5M")
-public class AccountIndexMigrationConfiguration {
+public class DistributedLockConfiguration {
     @Bean
     public LockProvider accountIndexMigrationLockProvider(
             CqlSession session, KeysByAccountIndexMigrationProperties properties) {

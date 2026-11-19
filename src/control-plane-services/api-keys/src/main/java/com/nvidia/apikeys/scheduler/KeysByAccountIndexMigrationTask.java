@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-package com.nvidia.apikeys.migration;
+package com.nvidia.apikeys.scheduler;
 
 import com.nvidia.apikeys.config.KeysByAccountIndexMigrationProperties;
 import com.nvidia.apikeys.config.NakProperties;
