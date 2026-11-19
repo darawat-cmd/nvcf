@@ -168,7 +168,7 @@ func completeAttributes(r *http.Request, response *http.Response, labeler *otelh
 		attribute.Int("http.response.status_code", response.StatusCode),
 	}
 	if port := r.URL.Port(); port != "" {
-		if n, err := strconv.Atoi(port); err == nil {
+		if n, err := strconv.Atoi(port); err == nil && !isDefaultPort(r.URL.Scheme, n) {
 			attrs = append(attrs, attribute.Int("server.port", n))
 		}
 	}
@@ -183,4 +183,11 @@ func completeAttributes(r *http.Request, response *http.Response, labeler *otelh
 		attrs = append(attrs, labeler.Get()...)
 	}
 	return attrs
+}
+
+// isDefaultPort reports whether port is the default for the URL scheme.
+// otelhttp omits server.port in that case, so the response-complete
+// histogram does the same to keep both label sets identical.
+func isDefaultPort(scheme string, port int) bool {
+	return (scheme == "https" && port == 443) || (scheme == "http" && port == 80)
 }

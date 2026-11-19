@@ -436,11 +436,16 @@ func TestResponseCompleteLabelsMatchClientDuration(t *testing.T) {
 		source     string
 		wantSource string
 		shadow     bool
+		url        string
+		wantPort   int
 	}{
-		{name: "success", status: 200},
-		{name: "worker error", status: 500, source: "worker", wantSource: "worker"},
-		{name: "unknown source", status: 503, wantSource: "unknown"},
-		{name: "shadow", status: 200, shadow: true},
+		{name: "success", status: 200, wantPort: 8080},
+		{name: "worker error", status: 500, source: "worker", wantSource: "worker", wantPort: 8080},
+		{name: "unknown source", status: 503, wantSource: "unknown", wantPort: 8080},
+		{name: "shadow", status: 200, shadow: true, wantPort: 8080},
+		{name: "http default port", status: 200, url: "http://upstream.test:80/infer"},
+		{name: "https default port", status: 200, url: "https://upstream.test:443/infer"},
+		{name: "https non-default port", status: 200, url: "https://upstream.test:8443/infer", wantPort: 8443},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			reader := useTestMeterProvider(t)
@@ -450,6 +455,11 @@ func TestResponseCompleteLabelsMatchClientDuration(t *testing.T) {
 				return &http.Response{StatusCode: tc.status, Header: h, Body: io.NopCloser(strings.NewReader("body"))}, nil
 			}))
 			req := completeTestRequest(t)
+			if tc.url != "" {
+				var reqErr error
+				req, reqErr = http.NewRequest(http.MethodPost, tc.url, nil)
+				require.NoError(t, reqErr)
+			}
 			if tc.shadow {
 				req = req.WithContext(ShadowTelemetryContext(req.Context()))
 			}
@@ -471,6 +481,11 @@ func TestResponseCompleteLabelsMatchClientDuration(t *testing.T) {
 			} else {
 				require.True(t, present)
 				require.Equal(t, tc.wantSource, got.AsString())
+			}
+			port, present := complete[0].Attributes.Value("server.port")
+			require.Equal(t, tc.wantPort != 0, present)
+			if present {
+				require.EqualValues(t, tc.wantPort, port.AsInt64())
 			}
 			kind, present := complete[0].Attributes.Value("gateway_call_kind")
 			require.True(t, present)
