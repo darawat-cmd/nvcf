@@ -88,8 +88,9 @@ readiness until the function's health check passes, set
 `PYLON_READINESS_GATE: "true"` in `agent.functionEnvOverrides`. `pylon` then
 waits for the health check declared on the function, with its path, port, and
 expected status. Only after that check passes does `pylon` calibrate and
-register. NVCA adds a readiness probe on `pylon`'s `/ready`. The worker becomes
-Ready, and the version `ACTIVE`, only after `pylon` has registered. The worker
+start to register. NVCA adds a readiness probe on `pylon`'s `/ready`. The worker
+becomes Ready, and the version `ACTIVE`, only after `pylon` starts registration.
+It does not wait for `llm-request-router` to accept it. The worker
 still has `INFERENCE_READY_TIMEOUT` to pass, as other functions do.
 `PYLON_READINESS_GATE` must be `true` or `false`; any other value stops `pylon`.
 
