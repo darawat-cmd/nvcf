@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -89,7 +90,7 @@ func newResponseCompleteHistogram(mp metric.MeterProvider) metric.Float64Histogr
 	histogram, err := mp.Meter("vanity-gateway/middleware").Float64Histogram(
 		responseCompleteMetricName,
 		metric.WithUnit("s"),
-		metric.WithDescription("Time from sending the upstream request to the end of the response body."),
+		metric.WithDescription("Time from sending the upstream request to the end of the response body. error.type is set to aborted or read_error when the body was closed before EOF."),
 		metric.WithExplicitBucketBoundaries(responseCompleteHistogramBoundaries...),
 	)
 	if err != nil {
@@ -132,43 +133,71 @@ func (rt clientMetricsRoundTripper) RoundTrip(r *http.Request) (*http.Response, 
 	// otelhttp records http.client.request.duration when headers arrive, so
 	// streamed bodies are invisible to it. Record the end-of-body duration
 	// separately when the body reaches EOF or is closed.
-	if rt.complete != nil && err == nil && response != nil && response.Body != nil {
+	//
+	// A 101 Switching Protocols body is the upgraded connection and must stay an
+	// io.Writer for httputil.ReverseProxy, so it is not wrapped.
+	if rt.complete != nil && err == nil && response != nil && response.Body != nil &&
+		response.StatusCode != http.StatusSwitchingProtocols {
 		response.Body = &completeTimingBody{
 			ReadCloser: response.Body,
-			record: func() {
+			record: func(errorType string) {
+				attrs := completeAttributes(r, response, labeler)
+				if errorType != "" {
+					attrs = append(attrs, attribute.String("error.type", errorType))
+				}
 				rt.complete.Record(r.Context(), time.Since(start).Seconds(),
-					metric.WithAttributes(completeAttributes(r, response, labeler)...))
+					metric.WithAttributes(attrs...))
 			},
 		}
 	}
 	return response, err
 }
 
-// completeTimingBody calls record once, on io.EOF or on Close, whichever comes
-// first. Other read errors, such as io.ErrUnexpectedEOF, do not record so a
-// later Close still can.
+// Bounded values of the error.type label on the response complete histogram.
+// A body that reaches EOF carries no error.type.
+const (
+	completeErrorAborted   = "aborted"
+	completeErrorReadError = "read_error"
+)
+
+// completeTimingBody calls record once: on io.EOF with no error type, or on
+// Close without EOF, tagged completeErrorReadError if a read failed or
+// completeErrorAborted otherwise (for example the client went away).
 type completeTimingBody struct {
 	io.ReadCloser
-	once   sync.Once
-	record func()
+	once       sync.Once
+	readFailed atomic.Bool
+	record     func(errorType string)
 }
 
 func (b *completeTimingBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
-	if err == io.EOF {
-		b.once.Do(b.record)
+	switch {
+	case err == io.EOF:
+		b.once.Do(func() { b.record("") })
+	case err != nil:
+		b.readFailed.Store(true)
 	}
 	return n, err
 }
 
 func (b *completeTimingBody) Close() error {
 	err := b.ReadCloser.Close()
-	b.once.Do(b.record)
+	b.once.Do(func() {
+		if b.readFailed.Load() {
+			b.record(completeErrorReadError)
+		} else {
+			b.record(completeErrorAborted)
+		}
+	})
 	return err
 }
 
-// completeAttributes mirrors the labels otelhttp puts on
+// completeAttributes mirrors the labels otelhttp v0.65.0 puts on
 // http.client.request.duration so both series can be compared per label set.
+// Re-check it against HTTPClient.MetricAttributes when otelhttp is upgraded.
+// Not mirrored: method normalization to _OTHER, defaulting an empty scheme, and
+// the Host fallback for server.address.
 func completeAttributes(r *http.Request, response *http.Response, labeler *otelhttp.Labeler) []attribute.KeyValue {
 	attrs := []attribute.KeyValue{
 		attribute.String("http.request.method", r.Method),

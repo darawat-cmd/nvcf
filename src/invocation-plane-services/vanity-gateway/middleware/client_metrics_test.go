@@ -366,6 +366,10 @@ func TestResponseCompleteRecordedAtEndOfBody(t *testing.T) {
 	require.GreaterOrEqual(t, points[0].Sum, bodyDelay.Seconds())
 	require.Equal(t, responseCompleteHistogramBoundaries, points[0].Bounds)
 
+	// A body read to EOF is a completed response and has no error.type.
+	_, hasErrorType := points[0].Attributes.Value("error.type")
+	require.False(t, hasErrorType)
+
 	// The existing client histogram keeps the shared buckets.
 	client := histogramPoints(t, reader, "http.client.request.duration")
 	require.Len(t, client, 1)
@@ -389,7 +393,14 @@ func TestResponseCompleteRecordsOnceOnReadThenClose(t *testing.T) {
 	require.EqualValues(t, 1, points[0].Count)
 }
 
-func TestResponseCompleteRecordsOnCloseWithoutReading(t *testing.T) {
+func requireCompleteErrorType(t *testing.T, point metricdata.HistogramDataPoint[float64], want string) {
+	t.Helper()
+	got, present := point.Attributes.Value("error.type")
+	require.True(t, present)
+	require.Equal(t, want, got.AsString())
+}
+
+func TestResponseCompleteTagsCloseWithoutReadingAsAborted(t *testing.T) {
 	reader := useTestMeterProvider(t)
 	transport := TracedRoundTripper(clientMetricTestTransport(func(*http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("unread"))}, nil
@@ -402,9 +413,51 @@ func TestResponseCompleteRecordsOnCloseWithoutReading(t *testing.T) {
 	points := histogramPoints(t, reader, completeMetricName)
 	require.Len(t, points, 1)
 	require.EqualValues(t, 1, points[0].Count)
+	requireCompleteErrorType(t, points[0], completeErrorAborted)
 }
 
-func TestResponseCompleteIgnoresNonEOFReadErrorUntilClose(t *testing.T) {
+// A client that goes away mid-stream makes ReverseProxy stop copying and close
+// the upstream body after a partial read with no error.
+func TestResponseCompleteTagsCloseAfterPartialReadAsAborted(t *testing.T) {
+	reader := useTestMeterProvider(t)
+	transport := TracedRoundTripper(clientMetricTestTransport(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("streaming body"))}, nil
+	}))
+	resp, err := transport.RoundTrip(completeTestRequest(t))
+	require.NoError(t, err)
+	n, err := resp.Body.Read(make([]byte, 4))
+	require.NoError(t, err)
+	require.Equal(t, 4, n)
+	require.Empty(t, histogramPoints(t, reader, completeMetricName))
+	require.NoError(t, resp.Body.Close())
+
+	points := histogramPoints(t, reader, completeMetricName)
+	require.Len(t, points, 1)
+	requireCompleteErrorType(t, points[0], completeErrorAborted)
+}
+
+func TestResponseCompleteSkipsUpgradeResponses(t *testing.T) {
+	reader := useTestMeterProvider(t)
+	transport := TracedRoundTripper(clientMetricTestTransport(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusSwitchingProtocols, Header: http.Header{}, Body: upgradeBody{strings.NewReader("")}}, nil
+	}))
+	resp, err := transport.RoundTrip(completeTestRequest(t))
+	require.NoError(t, err)
+
+	// ReverseProxy needs a writable body to complete an upgrade.
+	_, writable := resp.Body.(io.Writer)
+	require.True(t, writable, "upgrade response body must stay an io.Writer, got %T", resp.Body)
+	require.NoError(t, resp.Body.Close())
+	require.Empty(t, histogramPoints(t, reader, completeMetricName))
+}
+
+// upgradeBody stands in for the read-write body of a 101 response.
+type upgradeBody struct{ io.Reader }
+
+func (upgradeBody) Write(p []byte) (int, error) { return len(p), nil }
+func (upgradeBody) Close() error                { return nil }
+
+func TestResponseCompleteTagsReadErrorOnClose(t *testing.T) {
 	reader := useTestMeterProvider(t)
 	transport := TracedRoundTripper(clientMetricTestTransport(func(*http.Request) (*http.Response, error) {
 		body := io.NopCloser(io.MultiReader(strings.NewReader("par"), iotest.ErrReader(io.ErrUnexpectedEOF)))
@@ -418,10 +471,12 @@ func TestResponseCompleteIgnoresNonEOFReadErrorUntilClose(t *testing.T) {
 	// A failed read is not a completed body, so nothing is recorded yet.
 	require.Empty(t, histogramPoints(t, reader, completeMetricName))
 
+	// Close records the sample, tagged so it is not mistaken for a completion.
 	require.NoError(t, resp.Body.Close())
 	points := histogramPoints(t, reader, completeMetricName)
 	require.Len(t, points, 1)
 	require.EqualValues(t, 1, points[0].Count)
+	requireCompleteErrorType(t, points[0], completeErrorReadError)
 }
 
 func TestResponseCompleteSkippedOnTransportError(t *testing.T) {
